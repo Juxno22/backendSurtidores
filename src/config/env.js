@@ -45,14 +45,24 @@ export const env = {
   JWT_SECRET: required('JWT_SECRET'),
   JWT_EXPIRES_IN: optional('JWT_EXPIRES_IN', '8h'),
 
-  CORS_ORIGIN: optional('CORS_ORIGIN', 'http://localhost:3000'),
+  CORS_ORIGIN: optional('CORS_ORIGIN', 'https://productividad.diagsa.cloud'),
 
-  RATE_LIMIT_WINDOW_MS: numberEnv('RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000),
-  RATE_LIMIT_MAX: numberEnv('RATE_LIMIT_MAX', 300),
+  TRUST_PROXY: numberEnv('TRUST_PROXY', 1),
+
+  RATE_LIMIT_GENERAL_WINDOW_MS: numberEnv('RATE_LIMIT_GENERAL_WINDOW_MS', 15 * 60 * 1000),
+  RATE_LIMIT_GENERAL_MAX: numberEnv('RATE_LIMIT_GENERAL_MAX', 10000),
+
+  RATE_LIMIT_AUTH_WINDOW_MS: numberEnv('RATE_LIMIT_AUTH_WINDOW_MS', 15 * 60 * 1000),
+  RATE_LIMIT_AUTH_MAX: numberEnv('RATE_LIMIT_AUTH_MAX', 120),
+
+  RATE_LIMIT_UPLOAD_WINDOW_MS: numberEnv('RATE_LIMIT_UPLOAD_WINDOW_MS', 15 * 60 * 1000),
+  RATE_LIMIT_UPLOAD_MAX: numberEnv('RATE_LIMIT_UPLOAD_MAX', 300),
+
+  RATE_LIMIT_EXPORT_WINDOW_MS: numberEnv('RATE_LIMIT_EXPORT_WINDOW_MS', 15 * 60 * 1000),
+  RATE_LIMIT_EXPORT_MAX: numberEnv('RATE_LIMIT_EXPORT_MAX', 500),
 
   BODY_LIMIT: optional('BODY_LIMIT', '5mb')
 };
-
 export function getAllowedOrigins() {
   return env.CORS_ORIGIN
     .split(',')

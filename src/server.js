@@ -2,7 +2,12 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import rateLimit from 'express-rate-limit';
+import {
+  generalLimiter,
+  authLimiter,
+  uploadLimiter,
+  exportLimiter
+} from './middlewares/rateLimit.middleware.js';
 
 import { env, getAllowedOrigins, isProduction } from './config/env.js';
 import { testConnection, dbHealth, pool } from './config/db.js';
@@ -22,6 +27,8 @@ import exportacionesRoutes from './routes/exportaciones.routes.js';
 import auditoriaRoutes from './routes/auditoria.routes.js';
 
 const app = express();
+
+app.set('trust proxy', env.TRUST_PROXY);
 
 const allowedOrigins = getAllowedOrigins();
 
@@ -49,16 +56,10 @@ app.use(express.urlencoded({ extended: true, limit: env.BODY_LIMIT }));
 
 app.use(morgan(isProduction() ? 'combined' : 'dev'));
 
-app.use(rateLimit({
-  windowMs: env.RATE_LIMIT_WINDOW_MS,
-  max: env.RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    ok: false,
-    message: 'Demasiadas solicitudes. Intenta más tarde.'
-  }
-}));
+app.use('/api/auth/login', authLimiter);
+app.use('/api/productividad/reporte-grupal/importar-excel', uploadLimiter);
+app.use('/api/productividad/exportar', exportLimiter);
+app.use('/api', generalLimiter);
 
 app.get('/', (req, res) => {
   res.json({
