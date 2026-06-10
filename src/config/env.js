@@ -36,6 +36,8 @@ export const env = {
   NODE_ENV: optional('NODE_ENV', 'development'),
   PORT: numberEnv('PORT', 4000),
 
+  APP_TIMEZONE: optional('APP_TIMEZONE', 'America/Mexico_City'),
+
   DB_HOST: required('DB_HOST', 'localhost'),
   DB_PORT: numberEnv('DB_PORT', 3306),
   DB_USER: required('DB_USER', 'root'),

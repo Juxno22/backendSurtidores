@@ -1,5 +1,6 @@
 import { pool } from '../config/db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { getFechaOperativa } from '../utils/fechaOperativa.js';
 
 function toPositiveId(value, fieldName) {
   const id = Number(value);
@@ -285,6 +286,8 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       });
     }
 
+    const fechaOperativa = getFechaOperativa();
+
     const [result] = await connection.query(
       `
       INSERT INTO productividad_sesiones (
@@ -295,9 +298,14 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
         hora_inicio,
         estado
       )
-      VALUES (?, ?, ?, CURDATE(), NOW(), 'EN_PROCESO')
+      VALUES (?, ?, ?, ?, NOW(), 'EN_PROCESO')
       `,
-      [surtidor.id, surtidor.usuario_id, sucursal.id]
+      [
+        surtidor.id,
+        req.user.id,
+        sucursalId,
+        fechaOperativa
+      ]
     );
 
     const sesionId = result.insertId;
@@ -307,10 +315,11 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       usuarioId: req.user.id,
       tipoEvento: 'INICIO',
       datosDespues: {
+        sesion_id: sesionId,
         surtidor_id: surtidor.id,
-        usuario_id: surtidor.usuario_id,
-        sucursal_id: sucursal.id,
-        sucursal_nombre: sucursal.nombre,
+        usuario_id: req.user.id,
+        sucursal_id: sucursalId,
+        fecha_operativa: fechaOperativa,
         estado: 'EN_PROCESO'
       }
     });
