@@ -42,6 +42,16 @@ export const env = {
   DB_PASSWORD: optional('DB_PASSWORD', ''),
   DB_NAME: required('DB_NAME', 'db_productividad_surtidores'),
 
+  DB_CONNECTION_LIMIT: numberEnv('DB_CONNECTION_LIMIT', 10),
+  DB_MAX_IDLE: numberEnv('DB_MAX_IDLE', 5),
+  DB_IDLE_TIMEOUT: numberEnv('DB_IDLE_TIMEOUT', 60000),
+  DB_CONNECT_TIMEOUT: numberEnv('DB_CONNECT_TIMEOUT', 10000),
+
+  DB_RETRY_ATTEMPTS: numberEnv('DB_RETRY_ATTEMPTS', 3),
+
+  DB_HEARTBEAT_ENABLED: numberEnv('DB_HEARTBEAT_ENABLED', 1),
+  DB_HEARTBEAT_INTERVAL_MS: numberEnv('DB_HEARTBEAT_INTERVAL_MS', 240000),
+
   JWT_SECRET: required('JWT_SECRET'),
   JWT_EXPIRES_IN: optional('JWT_EXPIRES_IN', '8h'),
 

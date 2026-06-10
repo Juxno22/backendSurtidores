@@ -10,7 +10,13 @@ import {
 } from './middlewares/rateLimit.middleware.js';
 
 import { env, getAllowedOrigins, isProduction } from './config/env.js';
-import { testConnection, dbHealth, pool } from './config/db.js';
+import {
+  testConnection,
+  dbHealth,
+  pool,
+  startDbHeartbeat,
+  stopDbHeartbeat
+} from './config/db.js';
 
 import { notFoundMiddleware, errorMiddleware } from './middlewares/error.middleware.js';
 
@@ -125,6 +131,7 @@ let server;
 async function startServer() {
   try {
     await testConnection();
+    startDbHeartbeat();
 
     server = app.listen(env.PORT, '0.0.0.0', () => {
       console.log(`API Productividad Surtidores en http://localhost:${env.PORT}`);
@@ -146,6 +153,8 @@ async function shutdown(signal) {
         console.log('Servidor HTTP cerrado.');
       });
     }
+
+    stopDbHeartbeat();
 
     await pool.end();
     console.log('Pool MySQL cerrado.');
