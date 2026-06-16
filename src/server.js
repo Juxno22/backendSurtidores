@@ -17,9 +17,7 @@ import {
   startDbHeartbeat,
   stopDbHeartbeat
 } from './config/db.js';
-
 import { notFoundMiddleware, errorMiddleware } from './middlewares/error.middleware.js';
-
 import authRoutes from './routes/auth.routes.js';
 import usuariosRoutes from './routes/usuarios.routes.js';
 import sucursalesRoutes from './routes/sucursales.routes.js';
@@ -33,6 +31,7 @@ import productividadMetricasRoutes from './routes/productividadMetricas.routes.j
 import exportacionesRoutes from './routes/exportaciones.routes.js';
 import auditoriaRoutes from './routes/auditoria.routes.js';
 import checadoresRoutes from './routes/checadores.routes.js';
+import productividadDetalleRoutes from './routes/productividadDetalle.routes.js';
 
 const app = express();
 
@@ -133,6 +132,7 @@ app.use('/api/productividad/metricas', productividadMetricasRoutes);
 app.use('/api/productividad/exportar', exportacionesRoutes);
 app.use('/api/checadores', checadoresRoutes);
 app.use('/api/auditoria', auditoriaRoutes);
+app.use('/api/productividad/detalle', productividadDetalleRoutes);
 
 app.use(notFoundMiddleware);
 app.use(errorMiddleware);
