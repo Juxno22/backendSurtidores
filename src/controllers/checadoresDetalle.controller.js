@@ -55,7 +55,7 @@ async function getRegistrosChecadores(query) {
       cr.checador_id,
 
       c.nombre AS checador_nombre,
-      c.codigo AS checador_codigo,
+      c.id AS checador_codigo,
 
       DATE_FORMAT(cr.fecha, '%Y-%m-%d') AS fecha,
 
