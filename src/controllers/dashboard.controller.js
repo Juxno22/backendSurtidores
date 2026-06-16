@@ -1,5 +1,6 @@
 import { pool } from '../config/db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { diffSecondsLocal, getNowMexicoDateTime } from '../utils/mexicoTime.js';
 
 function validarFecha(fecha, fieldName = 'fecha') {
   const value = String(fecha || '').trim();
@@ -45,31 +46,50 @@ function round2(value) {
 }
 
 function calcularMetricas(base) {
-  const duracionSegundos = Number(base.duracion_segundos || 0);
-  const duracionHoras = duracionSegundos / 3600;
+  const duracionSegundos = Number(base?.duracion_segundos || 0);
+  const duracionLaboralSegundos = Number(base?.duracion_laboral_segundos || 0);
 
-  const tickets = Number(base.tickets || 0);
-  const partidas = Number(base.partidas || 0);
-  const monto = Number(base.monto || 0);
+  const partidas = Number(base?.partidas || base?.partidas_surtidas || 0);
+  const ceros = Number(base?.ceros || 0);
+  const noSurtido = Number(base?.no_surtido || base?.negados || 0);
+
+  const surtidoTotal = partidas + ceros + noSurtido;
+
+  const monto = Number(base?.monto || 0);
+  const duracionHoras = duracionSegundos / 3600;
+  const duracionLaboralHoras = duracionLaboralSegundos / 3600;
 
   return {
     ...base,
 
-    tickets,
-    partidas,
-    monto: round2(monto),
-    ceros: Number(base.ceros || 0),
-    no_surtido: Number(base.no_surtido || 0),
-    duracion_segundos: duracionSegundos,
+    tickets: surtidoTotal,
+    surtido_total: surtidoTotal,
 
+    partidas,
+    partidas_surtidas: partidas,
+
+    monto: round2(monto),
+    ceros,
+    no_surtido: noSurtido,
+    negados: noSurtido,
+
+    duracion_segundos: duracionSegundos,
     duracion_minutos: round2(duracionSegundos / 60),
     duracion_horas: round2(duracionHoras),
 
-    tickets_por_hora: duracionHoras > 0 ? round2(tickets / duracionHoras) : 0,
+    duracion_laboral_segundos: duracionLaboralSegundos,
+    duracion_laboral_minutos: round2(duracionLaboralSegundos / 60),
+    duracion_laboral_horas: round2(duracionLaboralHoras),
+
+    tickets_por_hora: duracionHoras > 0 ? round2(surtidoTotal / duracionHoras) : 0,
     partidas_por_hora: duracionHoras > 0 ? round2(partidas / duracionHoras) : 0,
+
+    surtido_por_hora_laboral: duracionLaboralHoras > 0 ? round2(surtidoTotal / duracionLaboralHoras) : 0,
+    partidas_por_hora_laboral: duracionLaboralHoras > 0 ? round2(partidas / duracionLaboralHoras) : 0,
+
     monto_por_hora: duracionHoras > 0 ? round2(monto / duracionHoras) : 0,
 
-    minutos_por_ticket: tickets > 0 ? round2((duracionSegundos / 60) / tickets) : 0,
+    minutos_por_surtido: surtidoTotal > 0 ? round2((duracionSegundos / 60) / surtidoTotal) : 0,
     minutos_por_partida: partidas > 0 ? round2((duracionSegundos / 60) / partidas) : 0
   };
 }
