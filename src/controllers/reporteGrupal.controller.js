@@ -62,17 +62,44 @@ function validarFecha(fecha) {
   return value;
 }
 
+function getFirstDefined(...values) {
+  return values.find((value) => value !== undefined);
+}
+
 function construirDatosReporte(body, actual = {}) {
+  const partidas = toNonNegativeInt(
+    getFirstDefined(body.partidas, body.partidas_surtidas),
+    'partidas',
+    actual.partidas ?? 0
+  );
+
+  const ceros = toNonNegativeInt(
+    body.ceros,
+    'ceros',
+    actual.ceros ?? 0
+  );
+
+  const noSurtido = toNonNegativeInt(
+    getFirstDefined(body.no_surtido, body.negados),
+    'no_surtido',
+    actual.no_surtido ?? 0
+  );
+
   return {
     fecha: body.fecha !== undefined ? validarFecha(body.fecha) : actual.fecha,
     sucursal_id: body.sucursal_id !== undefined
       ? toPositiveId(body.sucursal_id, 'sucursal_id')
       : actual.sucursal_id,
 
-    surtido: toNonNegativeInt(body.surtido, 'surtido', actual.surtido ?? 0),
-    partidas: toNonNegativeInt(body.partidas, 'partidas', actual.partidas ?? 0),
-    ceros: toNonNegativeInt(body.ceros, 'ceros', actual.ceros ?? 0),
-    no_surtido: toNonNegativeInt(body.no_surtido, 'no_surtido', actual.no_surtido ?? 0),
+    /*
+      Nueva regla operativa:
+      Surtido total siempre es calculado, no capturado.
+      surtido = partidas surtidas + ceros + negados.
+    */
+    surtido: partidas + ceros + noSurtido,
+    partidas,
+    ceros,
+    no_surtido: noSurtido,
     porcentaje_surtido: body.porcentaje_surtido !== undefined
       ? toNullablePercentage(body.porcentaje_surtido)
       : actual.porcentaje_surtido ?? null,
@@ -712,7 +739,14 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
     return res.status(400).json({
       ok: false,
       message: 'El Excel no contiene filas válidas para importar',
-      errores: parseResult.errores
+      hoja: parseResult.hoja,
+      hojas_procesadas: parseResult.hojas_procesadas,
+      hojas_ignoradas: parseResult.hojas_ignoradas,
+      total_hojas: parseResult.total_hojas,
+      total_hojas_procesadas: parseResult.total_hojas_procesadas,
+      total_hojas_ignoradas: parseResult.total_hojas_ignoradas,
+      errores: parseResult.errores,
+      warnings: parseResult.warnings
     });
   }
 
@@ -765,10 +799,18 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
         ok: false,
         message: 'El Excel tiene errores. Corrige las filas antes de importar.',
         hoja: parseResult.hoja,
+        hojas_procesadas: parseResult.hojas_procesadas,
+        hojas_ignoradas: parseResult.hojas_ignoradas,
+        total_hojas: parseResult.total_hojas,
+        total_hojas_procesadas: parseResult.total_hojas_procesadas,
+        total_hojas_ignoradas: parseResult.total_hojas_ignoradas,
         total_filas_excel: parseResult.total_filas_excel,
         total_rows_validas: parseResult.total_rows_validas,
         total_preparadas: rowsPreparadas.length,
+        fecha_min: parseResult.fecha_min,
+        fecha_max: parseResult.fecha_max,
         errores,
+        warnings: parseResult.warnings,
         preview: rowsPreparadas.slice(0, 20)
       });
     }
@@ -778,8 +820,16 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
         ok: true,
         message: 'Validación correcta. No se guardó información porque dry_run=1.',
         hoja: parseResult.hoja,
+        hojas_procesadas: parseResult.hojas_procesadas,
+        hojas_ignoradas: parseResult.hojas_ignoradas,
+        total_hojas: parseResult.total_hojas,
+        total_hojas_procesadas: parseResult.total_hojas_procesadas,
+        total_hojas_ignoradas: parseResult.total_hojas_ignoradas,
         total_filas_excel: parseResult.total_filas_excel,
         total_preparadas: rowsPreparadas.length,
+        fecha_min: parseResult.fecha_min,
+        fecha_max: parseResult.fecha_max,
+        warnings: parseResult.warnings,
         preview: rowsPreparadas.slice(0, 50)
       });
     }
@@ -889,9 +939,15 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
       resultados.push({
         id: reporteId,
         fila_excel: row.fila_excel,
+        origen: row.origen || `${row.hoja}:${row.fila_excel}`,
+        registros_agrupados: row.registros_agrupados || 1,
         fecha: row.fecha,
         sucursal_id: row.sucursal_id,
         sucursal_nombre: row.sucursal_nombre_bd,
+        surtido: row.surtido,
+        partidas: row.partidas,
+        ceros: row.ceros,
+        no_surtido: row.no_surtido,
         operacion
       });
     }
@@ -905,6 +961,10 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
       datosDespues: {
         archivo: req.file.originalname,
         hoja: parseResult.hoja,
+        hojas_procesadas: parseResult.hojas_procesadas,
+        hojas_ignoradas: parseResult.hojas_ignoradas,
+        fecha_min: parseResult.fecha_min,
+        fecha_max: parseResult.fecha_max,
         total_importados: resultados.length
       }
     });
@@ -916,9 +976,17 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
       message: 'Excel importado correctamente',
       archivo: req.file.originalname,
       hoja: parseResult.hoja,
+      hojas_procesadas: parseResult.hojas_procesadas,
+      hojas_ignoradas: parseResult.hojas_ignoradas,
+      total_hojas: parseResult.total_hojas,
+      total_hojas_procesadas: parseResult.total_hojas_procesadas,
+      total_hojas_ignoradas: parseResult.total_hojas_ignoradas,
+      fecha_min: parseResult.fecha_min,
+      fecha_max: parseResult.fecha_max,
       total_importados: resultados.length,
       creados: resultados.filter((r) => r.operacion === 'creado').length,
       actualizados: resultados.filter((r) => r.operacion === 'actualizado').length,
+      warnings: parseResult.warnings,
       resultados
     });
   } catch (error) {

@@ -119,6 +119,35 @@ function convertirFecha(value) {
     return `${anio}-${mes}-${dia}`;
   }
 
+  const matchYMD = raw.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+
+  if (matchYMD) {
+    return `${matchYMD[1]}-${matchYMD[2].padStart(2, '0')}-${matchYMD[3].padStart(2, '0')}`;
+  }
+
+  const matchTextDMY = raw.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
+
+  if (matchTextDMY) {
+    const dia = matchTextDMY[1].padStart(2, '0');
+    const mes = matchTextDMY[2].padStart(2, '0');
+    let anio = matchTextDMY[3];
+
+    if (anio.length === 2) {
+      anio = `20${anio}`;
+    }
+
+    return `${anio}-${mes}-${dia}`;
+  }
+
+  /*
+    Evitamos que nombres de hoja como "1", "2" o "10" se interpreten
+    como fechas raras por el parser nativo de JS. Esos casos se resuelven
+    con fechaDesdeNombreHoja usando el mes/año de fechaDefault.
+  */
+  if (/^\d{1,2}$/.test(raw)) {
+    return null;
+  }
+
   const parsed = new Date(raw);
 
   if (!Number.isNaN(parsed.getTime())) {
@@ -142,12 +171,15 @@ const ALIAS_COLUMNAS = {
     'SURTIDO',
     'TICKETS',
     'TICKETS_SURTIDOS',
-    'TOTAL_SURTIDO'
+    'TOTAL_SURTIDO',
+    'SURTIDO_TOTAL'
   ],
   partidas: [
     'PARTIDAS',
     'PARTIDA',
-    'TOTAL_PARTIDAS'
+    'TOTAL_PARTIDAS',
+    'PARTIDAS_SURTIDAS',
+    'PARTIDA_SURTIDA'
   ],
   ceros: [
     'CEROS',
@@ -159,6 +191,7 @@ const ALIAS_COLUMNAS = {
     'NO_SURTIDO',
     'NO_SURTIDOS',
     'NEGADOS',
+    'NEGADO',
     'NO_SURTIDO_NEGADOS',
     'NO_SURTIDO_Y_NEGADOS'
   ],
@@ -167,30 +200,345 @@ const ALIAS_COLUMNAS = {
     'PORCENTAJE_SURTIDO',
     'PORCENTAJE_S_DE_SURTIDO',
     'SURTIDO_PORCENTAJE',
-    'PORCENTAJE'
+    'PORCENTAJE',
+    'DE_SURTIDO'
   ]
 };
 
-function obtenerValorPorAlias(rowNormalizado, aliases) {
-  for (const alias of aliases) {
-    const key = normalizarTexto(alias);
+const HOJAS_A_IGNORAR = [
+  'DESCANSO',
+  'DESCANSOS',
+  'VACIO',
+  'VACIA'
+];
 
-    if (Object.prototype.hasOwnProperty.call(rowNormalizado, key)) {
-      return rowNormalizado[key];
+const FILAS_RESUMEN = new Set([
+  'TOTAL',
+  'TOTALES',
+  'SUMA',
+  'SUMAS',
+  'GRAN_TOTAL',
+  'TOTAL_GENERAL',
+  'GENERAL'
+]);
+
+function findColumnIndex(headers, aliases) {
+  return headers.findIndex((header) => aliases.some((alias) => header === normalizarTexto(alias)));
+}
+
+function detectarHeaderIndex(matrix) {
+  const maxRows = Math.min(matrix.length, 25);
+
+  for (let rowIndex = 0; rowIndex < maxRows; rowIndex += 1) {
+    const headers = (matrix[rowIndex] || []).map(normalizarTexto);
+
+    const tieneSucursal = findColumnIndex(headers, ALIAS_COLUMNAS.sucursal) >= 0;
+
+    const metricas = [
+      ALIAS_COLUMNAS.surtido,
+      ALIAS_COLUMNAS.partidas,
+      ALIAS_COLUMNAS.ceros,
+      ALIAS_COLUMNAS.no_surtido,
+      ALIAS_COLUMNAS.porcentaje_surtido
+    ].filter((aliases) => findColumnIndex(headers, aliases) >= 0).length;
+
+    if (tieneSucursal && metricas >= 2) {
+      return rowIndex;
     }
   }
 
-  return undefined;
+  return -1;
 }
 
-function normalizarRow(row) {
-  const normalizado = {};
+function detectarFechaHoja(matrix) {
+  const maxRows = Math.min(matrix.length, 12);
 
-  for (const [key, value] of Object.entries(row)) {
-    normalizado[normalizarTexto(key)] = value;
+  for (let rowIndex = 0; rowIndex < maxRows; rowIndex += 1) {
+    const row = matrix[rowIndex] || [];
+    const maxCols = Math.min(row.length, 10);
+
+    for (let colIndex = 0; colIndex < maxCols; colIndex += 1) {
+      const value = row[colIndex];
+      const normalizado = normalizarTexto(value);
+
+      if (!normalizado.includes('FECHA')) {
+        continue;
+      }
+
+      const fechaEnCelda = convertirFecha(value);
+
+      if (fechaEnCelda) {
+        return fechaEnCelda;
+      }
+
+      for (let offset = 1; offset <= 4; offset += 1) {
+        const fechaMismaFila = convertirFecha(row[colIndex + offset]);
+
+        if (fechaMismaFila) {
+          return fechaMismaFila;
+        }
+      }
+
+      for (let offset = 1; offset <= 3; offset += 1) {
+        const fechaAbajo = convertirFecha(matrix[rowIndex + offset]?.[colIndex]);
+
+        if (fechaAbajo) {
+          return fechaAbajo;
+        }
+      }
+    }
   }
 
-  return normalizado;
+  return null;
+}
+
+function fechaDesdeNombreHoja(sheetName, fechaDefault = null) {
+  const defaultFecha = convertirFecha(fechaDefault);
+  const raw = String(sheetName || '').trim();
+
+  if (!raw) return null;
+
+  const fechaDirecta = convertirFecha(raw);
+
+  if (fechaDirecta) {
+    return fechaDirecta;
+  }
+
+  if (!defaultFecha) return null;
+
+  const [anio, mes] = defaultFecha.split('-');
+  const diaMatch = raw.match(/^(\d{1,2})$/);
+
+  if (!diaMatch) return null;
+
+  const dia = Number(diaMatch[1]);
+
+  if (dia < 1 || dia > 31) return null;
+
+  return `${anio}-${mes}-${String(dia).padStart(2, '0')}`;
+}
+
+function debeIgnorarHojaPorNombre(sheetName) {
+  const normalizado = normalizarTexto(sheetName);
+
+  return HOJAS_A_IGNORAR.some((keyword) => normalizado.includes(keyword));
+}
+
+function debeIgnorarSucursal(value) {
+  const normalizado = normalizarSucursal(value);
+
+  return FILAS_RESUMEN.has(normalizado);
+}
+
+function getCell(row, index) {
+  if (index < 0) return undefined;
+
+  return row[index];
+}
+
+function procesarHoja({ sheetName, sheet, fechaDefault }) {
+  const matrix = xlsx.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: false,
+    blankrows: false
+  });
+
+  const errores = [];
+  const warnings = [];
+  const rows = [];
+
+  if (!matrix.length) {
+    return {
+      ignorada: true,
+      motivo: 'Hoja vacía',
+      errores,
+      warnings,
+      rows,
+      total_filas_excel: 0
+    };
+  }
+
+  if (debeIgnorarHojaPorNombre(sheetName)) {
+    return {
+      ignorada: true,
+      motivo: 'Hoja marcada como descanso/vacía',
+      errores,
+      warnings,
+      rows,
+      total_filas_excel: matrix.length
+    };
+  }
+
+  const headerIndex = detectarHeaderIndex(matrix);
+
+  if (headerIndex < 0) {
+    return {
+      ignorada: true,
+      motivo: 'No se encontró encabezado de reporte grupal',
+      errores,
+      warnings,
+      rows,
+      total_filas_excel: matrix.length
+    };
+  }
+
+  const headers = (matrix[headerIndex] || []).map(normalizarTexto);
+
+  const col = {
+    fecha: findColumnIndex(headers, ALIAS_COLUMNAS.fecha),
+    sucursal: findColumnIndex(headers, ALIAS_COLUMNAS.sucursal),
+    surtido: findColumnIndex(headers, ALIAS_COLUMNAS.surtido),
+    partidas: findColumnIndex(headers, ALIAS_COLUMNAS.partidas),
+    ceros: findColumnIndex(headers, ALIAS_COLUMNAS.ceros),
+    no_surtido: findColumnIndex(headers, ALIAS_COLUMNAS.no_surtido),
+    porcentaje_surtido: findColumnIndex(headers, ALIAS_COLUMNAS.porcentaje_surtido)
+  };
+
+  if (col.sucursal < 0) {
+    errores.push({
+      hoja: sheetName,
+      fila: headerIndex + 1,
+      campo: 'sucursal',
+      message: 'No se encontró columna SUCURSAL'
+    });
+  }
+
+  if (col.partidas < 0 || col.ceros < 0 || col.no_surtido < 0) {
+    errores.push({
+      hoja: sheetName,
+      fila: headerIndex + 1,
+      campo: 'columnas',
+      message: 'El Excel debe traer PARTIDAS, CEROS y NO SURTIDO/NEGADOS'
+    });
+  }
+
+  const fechaHoja = detectarFechaHoja(matrix) || fechaDesdeNombreHoja(sheetName, fechaDefault) || convertirFecha(fechaDefault);
+
+  for (let rowIndex = headerIndex + 1; rowIndex < matrix.length; rowIndex += 1) {
+    const row = matrix[rowIndex] || [];
+    const filaExcel = rowIndex + 1;
+
+    const sucursalRaw = getCell(row, col.sucursal);
+    const sucursalNombre = String(sucursalRaw ?? '').trim();
+
+    if (debeIgnorarSucursal(sucursalNombre)) {
+      continue;
+    }
+
+    const fecha = convertirFecha(getCell(row, col.fecha)) || fechaHoja;
+
+    const surtidoExcel = convertirEntero(getCell(row, col.surtido), 0);
+    const partidas = convertirEntero(getCell(row, col.partidas), 0);
+    const ceros = convertirEntero(getCell(row, col.ceros), 0);
+    const noSurtido = convertirEntero(getCell(row, col.no_surtido), 0);
+    const surtidoCalculado = partidas + ceros + noSurtido;
+
+    const porcentajeSurtido = convertirPorcentaje(getCell(row, col.porcentaje_surtido));
+
+    const filaVacia =
+      !sucursalNombre &&
+      !fecha &&
+      surtidoExcel === 0 &&
+      partidas === 0 &&
+      ceros === 0 &&
+      noSurtido === 0 &&
+      porcentajeSurtido === null;
+
+    if (filaVacia) {
+      continue;
+    }
+
+    if (!fecha) {
+      errores.push({
+        hoja: sheetName,
+        fila: filaExcel,
+        campo: 'fecha',
+        message: 'Fecha inválida o faltante'
+      });
+    }
+
+    if (!sucursalNombre) {
+      errores.push({
+        hoja: sheetName,
+        fila: filaExcel,
+        campo: 'sucursal',
+        message: 'Sucursal faltante'
+      });
+    }
+
+    if (surtidoExcel > 0 && surtidoExcel !== surtidoCalculado) {
+      warnings.push({
+        hoja: sheetName,
+        fila: filaExcel,
+        campo: 'surtido',
+        message: `El surtido del Excel (${surtidoExcel}) no coincide con partidas+ceros+negados (${surtidoCalculado}). Se usará el calculado.`
+      });
+    }
+
+    rows.push({
+      hoja: sheetName,
+      fila_excel: filaExcel,
+      fecha,
+      sucursal_nombre: sucursalNombre,
+      sucursal_key: normalizarSucursal(sucursalNombre),
+      surtido: surtidoCalculado,
+      surtido_excel: surtidoExcel,
+      partidas,
+      ceros,
+      no_surtido: noSurtido,
+      porcentaje_surtido: porcentajeSurtido,
+      fuente: 'EXCEL'
+    });
+  }
+
+  return {
+    ignorada: false,
+    motivo: null,
+    errores,
+    warnings,
+    rows,
+    header_fila: headerIndex + 1,
+    fecha_detectada: fechaHoja,
+    total_filas_excel: matrix.length
+  };
+}
+
+function agruparRows(rows) {
+  const map = new Map();
+
+  for (const row of rows) {
+    const key = `${row.fecha}::${row.sucursal_key}`;
+
+    if (!map.has(key)) {
+      map.set(key, {
+        ...row,
+        filas_origen: [`${row.hoja}:${row.fila_excel}`],
+        registros_agrupados: 1
+      });
+
+      continue;
+    }
+
+    const actual = map.get(key);
+
+    actual.surtido += row.surtido;
+    actual.surtido_excel += row.surtido_excel;
+    actual.partidas += row.partidas;
+    actual.ceros += row.ceros;
+    actual.no_surtido += row.no_surtido;
+    actual.registros_agrupados += 1;
+    actual.filas_origen.push(`${row.hoja}:${row.fila_excel}`);
+
+    if (row.porcentaje_surtido !== null && row.porcentaje_surtido !== undefined) {
+      actual.porcentaje_surtido = row.porcentaje_surtido;
+    }
+  }
+
+  return [...map.values()].map((row) => ({
+    ...row,
+    origen: row.filas_origen.join(', ')
+  }));
 }
 
 export function parseReporteGrupalExcel(buffer, options = {}) {
@@ -208,108 +556,86 @@ export function parseReporteGrupalExcel(buffer, options = {}) {
     return {
       ok: false,
       errores: ['El archivo no contiene hojas'],
+      warnings: [],
       rows: []
     };
   }
 
-  const nombreHoja = sheetName && workbook.Sheets[sheetName]
-    ? sheetName
-    : workbook.SheetNames[0];
+  const hojasSolicitadas = sheetName
+    ? workbook.SheetNames.filter((nombre) => nombre === sheetName)
+    : workbook.SheetNames;
 
-  const sheet = workbook.Sheets[nombreHoja];
-
-  const rawRows = xlsx.utils.sheet_to_json(sheet, {
-    defval: null,
-    raw: false
-  });
+  if (sheetName && hojasSolicitadas.length === 0) {
+    return {
+      ok: false,
+      errores: [{
+        hoja: sheetName,
+        fila: null,
+        campo: 'sheet',
+        message: `No existe la hoja "${sheetName}" en el archivo`
+      }],
+      warnings: [],
+      rows: []
+    };
+  }
 
   const errores = [];
-  const rows = [];
+  const warnings = [];
+  const rowsDetalle = [];
+  const hojasProcesadas = [];
+  const hojasIgnoradas = [];
 
-  rawRows.forEach((row, index) => {
-    const filaExcel = index + 2;
-    const normalizado = normalizarRow(row);
-
-    const sucursalRaw = obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.sucursal);
-    const sucursalNombre = String(sucursalRaw ?? '').trim();
-
-    const fechaRaw = obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.fecha);
-    const fecha = convertirFecha(fechaRaw) || convertirFecha(fechaDefault);
-
-    const surtido = convertirEntero(
-      obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.surtido),
-      0
-    );
-
-    const partidas = convertirEntero(
-      obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.partidas),
-      0
-    );
-
-    const ceros = convertirEntero(
-      obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.ceros),
-      0
-    );
-
-    const noSurtido = convertirEntero(
-      obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.no_surtido),
-      0
-    );
-
-    const porcentajeSurtido = convertirPorcentaje(
-      obtenerValorPorAlias(normalizado, ALIAS_COLUMNAS.porcentaje_surtido)
-    );
-
-    const filaVacia =
-      !sucursalNombre &&
-      !fecha &&
-      surtido === 0 &&
-      partidas === 0 &&
-      ceros === 0 &&
-      noSurtido === 0 &&
-      porcentajeSurtido === null;
-
-    if (filaVacia) {
-      return;
-    }
-
-    if (!fecha) {
-      errores.push({
-        fila: filaExcel,
-        campo: 'fecha',
-        message: 'Fecha inválida o faltante'
-      });
-    }
-
-    if (!sucursalNombre) {
-      errores.push({
-        fila: filaExcel,
-        campo: 'sucursal',
-        message: 'Sucursal faltante'
-      });
-    }
-
-    rows.push({
-      fila_excel: filaExcel,
-      fecha,
-      sucursal_nombre: sucursalNombre,
-      sucursal_key: normalizarSucursal(sucursalNombre),
-      surtido,
-      partidas,
-      ceros,
-      no_surtido: noSurtido,
-      porcentaje_surtido: porcentajeSurtido,
-      fuente: 'EXCEL'
+  for (const nombreHoja of hojasSolicitadas) {
+    const resultadoHoja = procesarHoja({
+      sheetName: nombreHoja,
+      sheet: workbook.Sheets[nombreHoja],
+      fechaDefault
     });
-  });
+
+    errores.push(...resultadoHoja.errores);
+    warnings.push(...resultadoHoja.warnings);
+
+    if (resultadoHoja.ignorada) {
+      hojasIgnoradas.push({
+        hoja: nombreHoja,
+        motivo: resultadoHoja.motivo,
+        total_filas_excel: resultadoHoja.total_filas_excel
+      });
+
+      continue;
+    }
+
+    rowsDetalle.push(...resultadoHoja.rows);
+
+    hojasProcesadas.push({
+      hoja: nombreHoja,
+      header_fila: resultadoHoja.header_fila,
+      fecha_detectada: resultadoHoja.fecha_detectada,
+      total_filas_excel: resultadoHoja.total_filas_excel,
+      total_rows: resultadoHoja.rows.length
+    });
+  }
+
+  const rows = agruparRows(rowsDetalle);
+  const fechas = rows.map((row) => row.fecha).filter(Boolean).sort();
 
   return {
     ok: errores.length === 0,
-    hoja: nombreHoja,
-    total_filas_excel: rawRows.length,
+    hoja: sheetName || null,
+    hojas_procesadas: hojasProcesadas,
+    hojas_ignoradas: hojasIgnoradas,
+    total_hojas: workbook.SheetNames.length,
+    total_hojas_procesadas: hojasProcesadas.length,
+    total_hojas_ignoradas: hojasIgnoradas.length,
+    total_filas_excel: rowsDetalle.length,
     total_rows_validas: rows.length,
+    total_rows_detalle: rowsDetalle.length,
+    fecha_min: fechas[0] || null,
+    fecha_max: fechas[fechas.length - 1] || null,
     errores,
-    rows
+    warnings,
+    rows,
+    rows_detalle: rowsDetalle
   };
 }
 
