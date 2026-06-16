@@ -31,16 +31,11 @@ const rawPool = mysql.createPool({
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
 
+  dateStrings: true,
   decimalNumbers: true,
-  timezone: 'Z',
 
   connectTimeout: env.DB_CONNECT_TIMEOUT || 10000,
 
-  /*
-    Importante:
-    mantenemos menos conexiones idle para evitar que el pool guarde
-    muchas conexiones viejas que MySQL ya cerró por inactividad.
-  */
   maxIdle: env.DB_MAX_IDLE || 5,
   idleTimeout: env.DB_IDLE_TIMEOUT || 60000
 });

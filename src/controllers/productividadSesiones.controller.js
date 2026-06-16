@@ -1,6 +1,13 @@
 import { pool } from '../config/db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { getFechaOperativa } from '../utils/fechaOperativa.js';
+import {
+  getFechaOperativaMexico,
+  getNowMexicoDateTime,
+  diffSecondsLocal
+} from '../utils/mexicoTime.js';
+import {
+  getSegundosLaboralesEntre
+} from '../utils/jornadaLaboral.js';
 
 function toPositiveId(value, fieldName) {
   const id = Number(value);
@@ -30,24 +37,51 @@ function toNonNegativeInt(value, fieldName, defaultValue = 0) {
   return number;
 }
 
-function toNonNegativeDecimal(value, fieldName, defaultValue = 0) {
-  if (value === undefined || value === null || value === '') {
-    return defaultValue;
-  }
-
-  const number = Number(value);
-
-  if (Number.isNaN(number) || number < 0) {
-    const error = new Error(`${fieldName} debe ser un número mayor o igual a 0`);
-    error.status = 400;
-    throw error;
-  }
-
-  return Number(number.toFixed(2));
-}
-
 function json(value) {
   return JSON.stringify(value ?? null);
+}
+
+async function safeRollback(connection) {
+  try {
+    await connection.rollback();
+  } catch (rollbackError) {
+    console.warn('Rollback falló después del error principal:', {
+      code: rollbackError?.code,
+      message: rollbackError?.message
+    });
+  }
+}
+
+function formatRuntimeFields(row, nowMexico = getNowMexicoDateTime()) {
+  if (!row) return row;
+
+  const isActive = row.estado === 'EN_PROCESO';
+  const runtimeSeconds = isActive
+    ? diffSecondsLocal(row.hora_inicio, nowMexico)
+    : Number(row.duracion_segundos || 0);
+
+  const runtimeLaboralSeconds = isActive
+    ? getSegundosLaboralesEntre(row.hora_inicio, nowMexico)
+    : Number(row.duracion_laboral_segundos || 0);
+
+  return {
+    ...row,
+
+    surtido_total: Number(row.tickets || 0),
+    partidas_surtidas: Number(row.partidas || 0),
+    negados: Number(row.no_surtido || 0),
+
+    duracion_segundos: Number(row.duracion_segundos || 0),
+    duracion_laboral_segundos: Number(row.duracion_laboral_segundos || 0),
+
+    segundos_transcurridos: runtimeSeconds,
+    minutos_transcurridos: Number((runtimeSeconds / 60).toFixed(2)),
+    horas_transcurridas: Number((runtimeSeconds / 3600).toFixed(2)),
+
+    segundos_laborales_transcurridos: runtimeLaboralSeconds,
+    minutos_laborales_transcurridos: Number((runtimeLaboralSeconds / 60).toFixed(2)),
+    horas_laborales_transcurridas: Number((runtimeLaboralSeconds / 3600).toFixed(2))
+  };
 }
 
 async function registrarEvento(connection, {
@@ -197,32 +231,39 @@ async function obtenerSesionPorId(connection, id) {
       ps.sucursal_id,
       s.nombre AS sucursal_nombre,
 
-      ps.fecha_operativa,
-      ps.hora_inicio,
-      ps.hora_fin,
+      DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha_operativa,
+      DATE_FORMAT(ps.hora_inicio, '%Y-%m-%d %H:%i:%s') AS hora_inicio,
+      DATE_FORMAT(ps.hora_fin, '%Y-%m-%d %H:%i:%s') AS hora_fin,
+
       ps.duracion_segundos,
+      ps.duracion_laboral_segundos,
 
       ROUND(ps.duracion_segundos / 60, 2) AS duracion_minutos,
       ROUND(ps.duracion_segundos / 3600, 2) AS duracion_horas,
+      ROUND(ps.duracion_laboral_segundos / 60, 2) AS duracion_laboral_minutos,
+      ROUND(ps.duracion_laboral_segundos / 3600, 2) AS duracion_laboral_horas,
 
       ps.tickets,
+      ps.tickets AS surtido_total,
       ps.partidas,
+      ps.partidas AS partidas_surtidas,
       ps.monto,
       ps.ceros,
       ps.no_surtido,
+      ps.no_surtido AS negados,
 
       ps.observaciones,
       ps.estado,
 
       ps.cancelado_motivo,
       ps.cancelado_por,
-      ps.cancelado_at,
+      DATE_FORMAT(ps.cancelado_at, '%Y-%m-%d %H:%i:%s') AS cancelado_at,
 
       ps.finalizado_por,
-      ps.finalizado_at,
+      DATE_FORMAT(ps.finalizado_at, '%Y-%m-%d %H:%i:%s') AS finalizado_at,
 
-      ps.created_at,
-      ps.updated_at
+      DATE_FORMAT(ps.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(ps.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
     FROM productividad_sesiones ps
     INNER JOIN surtidores su ON su.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = ps.usuario_id
@@ -233,16 +274,39 @@ async function obtenerSesionPorId(connection, id) {
     [id]
   );
 
-  return rows[0] || null;
+  return formatRuntimeFields(rows[0] || null);
 }
 
 function construirPayloadDatos(body, actual = {}) {
+  const partidasSurtidas = toNonNegativeInt(
+    body.partidas_surtidas ?? body.partidas,
+    'partidas_surtidas',
+    actual.partidas ?? 0
+  );
+
+  const ceros = toNonNegativeInt(
+    body.ceros,
+    'ceros',
+    actual.ceros ?? 0
+  );
+
+  const negados = toNonNegativeInt(
+    body.negados ?? body.no_surtido,
+    'negados',
+    actual.no_surtido ?? 0
+  );
+
+  const surtidoTotal = partidasSurtidas + ceros + negados;
+
   return {
-    tickets: toNonNegativeInt(body.tickets, 'tickets', actual.tickets ?? 0),
-    partidas: toNonNegativeInt(body.partidas, 'partidas', actual.partidas ?? 0),
-    monto: toNonNegativeDecimal(body.monto, 'monto', actual.monto ?? 0),
-    ceros: toNonNegativeInt(body.ceros, 'ceros', actual.ceros ?? 0),
-    no_surtido: toNonNegativeInt(body.no_surtido, 'no_surtido', actual.no_surtido ?? 0),
+    tickets: surtidoTotal,
+    surtido_total: surtidoTotal,
+    partidas: partidasSurtidas,
+    partidas_surtidas: partidasSurtidas,
+    monto: 0,
+    ceros,
+    no_surtido: negados,
+    negados,
     observaciones: body.observaciones !== undefined
       ? String(body.observaciones || '').trim() || null
       : actual.observaciones ?? null
@@ -263,7 +327,7 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       req.body.surtidor_id
     );
 
-    const sucursal = await validarSucursalActiva(connection, sucursalId);
+    await validarSucursalActiva(connection, sucursalId);
 
     const [abierta] = await connection.query(
       `
@@ -286,7 +350,8 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       });
     }
 
-    const fechaOperativa = getFechaOperativa();
+    const fechaOperativa = getFechaOperativaMexico();
+    const horaInicio = getNowMexicoDateTime();
 
     const [result] = await connection.query(
       `
@@ -298,13 +363,14 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
         hora_inicio,
         estado
       )
-      VALUES (?, ?, ?, ?, NOW(), 'EN_PROCESO')
+      VALUES (?, ?, ?, ?, ?, 'EN_PROCESO')
       `,
       [
         surtidor.id,
         req.user.id,
         sucursalId,
-        fechaOperativa
+        fechaOperativa,
+        horaInicio
       ]
     );
 
@@ -320,6 +386,7 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
         usuario_id: req.user.id,
         sucursal_id: sucursalId,
         fecha_operativa: fechaOperativa,
+        hora_inicio: horaInicio,
         estado: 'EN_PROCESO'
       }
     });
@@ -334,7 +401,7 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       sesion
     });
   } catch (error) {
-    await connection.rollback();
+    await safeRollback(connection);
     throw error;
   } finally {
     connection.release();
@@ -379,24 +446,26 @@ export const obtenerSesionActiva = asyncHandler(async (req, res) => {
         ps.sucursal_id,
         s.nombre AS sucursal_nombre,
 
-        ps.fecha_operativa,
-        ps.hora_inicio,
-        ps.hora_fin,
-        ps.duracion_segundos,
+        DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha_operativa,
+        DATE_FORMAT(ps.hora_inicio, '%Y-%m-%d %H:%i:%s') AS hora_inicio,
+        DATE_FORMAT(ps.hora_fin, '%Y-%m-%d %H:%i:%s') AS hora_fin,
 
-        TIMESTAMPDIFF(SECOND, ps.hora_inicio, NOW()) AS segundos_transcurridos,
-        ROUND(TIMESTAMPDIFF(SECOND, ps.hora_inicio, NOW()) / 60, 2) AS minutos_transcurridos,
+        ps.duracion_segundos,
+        ps.duracion_laboral_segundos,
 
         ps.tickets,
+        ps.tickets AS surtido_total,
         ps.partidas,
+        ps.partidas AS partidas_surtidas,
         ps.monto,
         ps.ceros,
         ps.no_surtido,
+        ps.no_surtido AS negados,
 
         ps.observaciones,
         ps.estado,
-        ps.created_at,
-        ps.updated_at
+        DATE_FORMAT(ps.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+        DATE_FORMAT(ps.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
       FROM productividad_sesiones ps
       INNER JOIN surtidores su ON su.id = ps.surtidor_id
       INNER JOIN usuarios u ON u.id = ps.usuario_id
@@ -408,16 +477,19 @@ export const obtenerSesionActiva = asyncHandler(async (req, res) => {
       params
     );
 
+    const nowMexico = getNowMexicoDateTime();
+    const sesiones = rows.map((row) => formatRuntimeFields(row, nowMexico));
+
     if (req.user.rol === 'SURTIDOR' || req.query.surtidor_id) {
       return res.json({
         ok: true,
-        sesion: rows[0] || null
+        sesion: sesiones[0] || null
       });
     }
 
     return res.json({
       ok: true,
-      sesiones: rows
+      sesiones
     });
   } finally {
     connection.release();
@@ -464,7 +536,7 @@ export const listarSesiones = asyncHandler(async (req, res) => {
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
 
-  const [sesiones] = await pool.query(
+  const [rows] = await pool.query(
     `
     SELECT
       ps.id,
@@ -477,34 +549,46 @@ export const listarSesiones = asyncHandler(async (req, res) => {
       ps.sucursal_id,
       s.nombre AS sucursal_nombre,
 
-      ps.fecha_operativa,
-      ps.hora_inicio,
-      ps.hora_fin,
+      DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha_operativa,
+      DATE_FORMAT(ps.hora_inicio, '%Y-%m-%d %H:%i:%s') AS hora_inicio,
+      DATE_FORMAT(ps.hora_fin, '%Y-%m-%d %H:%i:%s') AS hora_fin,
+
       ps.duracion_segundos,
+      ps.duracion_laboral_segundos,
 
       ROUND(ps.duracion_segundos / 60, 2) AS duracion_minutos,
       ROUND(ps.duracion_segundos / 3600, 2) AS duracion_horas,
+      ROUND(ps.duracion_laboral_segundos / 60, 2) AS duracion_laboral_minutos,
+      ROUND(ps.duracion_laboral_segundos / 3600, 2) AS duracion_laboral_horas,
 
       ps.tickets,
+      ps.tickets AS surtido_total,
       ps.partidas,
+      ps.partidas AS partidas_surtidas,
       ps.monto,
       ps.ceros,
       ps.no_surtido,
+      ps.no_surtido AS negados,
 
       CASE
         WHEN ps.duracion_segundos > 0 THEN ROUND(ps.tickets / (ps.duracion_segundos / 3600), 2)
         ELSE 0
-      END AS tickets_por_hora,
+      END AS surtido_por_hora_real,
 
       CASE
-        WHEN ps.duracion_segundos > 0 THEN ROUND(ps.partidas / (ps.duracion_segundos / 3600), 2)
+        WHEN ps.duracion_laboral_segundos > 0 THEN ROUND(ps.tickets / (ps.duracion_laboral_segundos / 3600), 2)
         ELSE 0
-      END AS partidas_por_hora,
+      END AS surtido_por_hora_laboral,
+
+      CASE
+        WHEN ps.duracion_laboral_segundos > 0 THEN ROUND(ps.partidas / (ps.duracion_laboral_segundos / 3600), 2)
+        ELSE 0
+      END AS partidas_por_hora_laboral,
 
       ps.observaciones,
       ps.estado,
-      ps.created_at,
-      ps.updated_at
+      DATE_FORMAT(ps.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(ps.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
     FROM productividad_sesiones ps
     INNER JOIN surtidores su ON su.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = ps.usuario_id
@@ -515,6 +599,9 @@ export const listarSesiones = asyncHandler(async (req, res) => {
     `,
     params
   );
+
+  const nowMexico = getNowMexicoDateTime();
+  const sesiones = rows.map((row) => formatRuntimeFields(row, nowMexico));
 
   res.json({
     ok: true,
@@ -573,13 +660,14 @@ export const guardarAvance = asyncHandler(async (req, res) => {
     }
 
     const datos = construirPayloadDatos(req.body, sesionActual);
+    const nowMexico = getNowMexicoDateTime();
 
     const datosAntes = {
-      tickets: sesionActual.tickets,
-      partidas: sesionActual.partidas,
-      monto: sesionActual.monto,
+      surtido_total: sesionActual.tickets,
+      partidas_surtidas: sesionActual.partidas,
       ceros: sesionActual.ceros,
-      no_surtido: sesionActual.no_surtido,
+      negados: sesionActual.no_surtido,
+      monto: sesionActual.monto,
       observaciones: sesionActual.observaciones
     };
 
@@ -589,19 +677,20 @@ export const guardarAvance = asyncHandler(async (req, res) => {
       SET
         tickets = ?,
         partidas = ?,
-        monto = ?,
+        monto = 0,
         ceros = ?,
         no_surtido = ?,
-        observaciones = ?
+        observaciones = ?,
+        updated_at = ?
       WHERE id = ?
       `,
       [
-        datos.tickets,
-        datos.partidas,
-        datos.monto,
+        datos.surtido_total,
+        datos.partidas_surtidas,
         datos.ceros,
-        datos.no_surtido,
+        datos.negados,
         datos.observaciones,
+        nowMexico,
         id
       ]
     );
@@ -624,7 +713,7 @@ export const guardarAvance = asyncHandler(async (req, res) => {
       sesion
     });
   } catch (error) {
-    await connection.rollback();
+    await safeRollback(connection);
     throw error;
   } finally {
     connection.release();
@@ -662,13 +751,24 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
     }
 
     const datos = construirPayloadDatos(req.body, sesionActual);
+    const horaFin = getNowMexicoDateTime();
+
+    const duracionSegundos = diffSecondsLocal(
+      sesionActual.hora_inicio,
+      horaFin
+    );
+
+    const duracionLaboralSegundos = getSegundosLaboralesEntre(
+      sesionActual.hora_inicio,
+      horaFin
+    );
 
     const datosAntes = {
-      tickets: sesionActual.tickets,
-      partidas: sesionActual.partidas,
-      monto: sesionActual.monto,
+      surtido_total: sesionActual.tickets,
+      partidas_surtidas: sesionActual.partidas,
       ceros: sesionActual.ceros,
-      no_surtido: sesionActual.no_surtido,
+      negados: sesionActual.no_surtido,
+      monto: sesionActual.monto,
       observaciones: sesionActual.observaciones,
       estado: sesionActual.estado
     };
@@ -679,25 +779,31 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
       SET
         tickets = ?,
         partidas = ?,
-        monto = ?,
+        monto = 0,
         ceros = ?,
         no_surtido = ?,
         observaciones = ?,
-        hora_fin = NOW(),
-        duracion_segundos = TIMESTAMPDIFF(SECOND, hora_inicio, NOW()),
+        hora_fin = ?,
+        duracion_segundos = ?,
+        duracion_laboral_segundos = ?,
         estado = 'FINALIZADO',
         finalizado_por = ?,
-        finalizado_at = NOW()
+        finalizado_at = ?,
+        updated_at = ?
       WHERE id = ?
       `,
       [
-        datos.tickets,
-        datos.partidas,
-        datos.monto,
+        datos.surtido_total,
+        datos.partidas_surtidas,
         datos.ceros,
-        datos.no_surtido,
+        datos.negados,
         datos.observaciones,
+        horaFin,
+        duracionSegundos,
+        duracionLaboralSegundos,
         req.user.id,
+        horaFin,
+        horaFin,
         id
       ]
     );
@@ -709,6 +815,9 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
       datosAntes,
       datosDespues: {
         ...datos,
+        hora_fin: horaFin,
+        duracion_segundos: duracionSegundos,
+        duracion_laboral_segundos: duracionLaboralSegundos,
         estado: 'FINALIZADO'
       }
     });
@@ -723,7 +832,7 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
       sesion
     });
   } catch (error) {
-    await connection.rollback();
+    await safeRollback(connection);
     throw error;
   } finally {
     connection.release();
@@ -768,19 +877,42 @@ export const cancelarSesion = asyncHandler(async (req, res) => {
       });
     }
 
+    const horaFin = getNowMexicoDateTime();
+
+    const duracionSegundos = diffSecondsLocal(
+      sesionActual.hora_inicio,
+      horaFin
+    );
+
+    const duracionLaboralSegundos = getSegundosLaboralesEntre(
+      sesionActual.hora_inicio,
+      horaFin
+    );
+
     await connection.query(
       `
       UPDATE productividad_sesiones
       SET
-        hora_fin = NOW(),
-        duracion_segundos = TIMESTAMPDIFF(SECOND, hora_inicio, NOW()),
+        hora_fin = ?,
+        duracion_segundos = ?,
+        duracion_laboral_segundos = ?,
         estado = 'CANCELADO',
         cancelado_motivo = ?,
         cancelado_por = ?,
-        cancelado_at = NOW()
+        cancelado_at = ?,
+        updated_at = ?
       WHERE id = ?
       `,
-      [motivo, req.user.id, id]
+      [
+        horaFin,
+        duracionSegundos,
+        duracionLaboralSegundos,
+        motivo,
+        req.user.id,
+        horaFin,
+        horaFin,
+        id
+      ]
     );
 
     await registrarEvento(connection, {
@@ -792,7 +924,10 @@ export const cancelarSesion = asyncHandler(async (req, res) => {
       },
       datosDespues: {
         estado: 'CANCELADO',
-        motivo
+        motivo,
+        hora_fin: horaFin,
+        duracion_segundos: duracionSegundos,
+        duracion_laboral_segundos: duracionLaboralSegundos
       },
       motivo
     });
@@ -807,7 +942,7 @@ export const cancelarSesion = asyncHandler(async (req, res) => {
       sesion
     });
   } catch (error) {
-    await connection.rollback();
+    await safeRollback(connection);
     throw error;
   } finally {
     connection.release();

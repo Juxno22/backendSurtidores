@@ -44,6 +44,16 @@ export const env = {
   DB_PASSWORD: optional('DB_PASSWORD', ''),
   DB_NAME: required('DB_NAME', 'db_productividad_surtidores'),
 
+  JORNADA_LV_INICIO: optional('JORNADA_LV_INICIO', '10:00'),
+  JORNADA_LV_FIN: optional('JORNADA_LV_FIN', '19:00'),
+  JORNADA_LV_COMIDA_INICIO: optional('JORNADA_LV_COMIDA_INICIO', '14:00'),
+  JORNADA_LV_COMIDA_FIN: optional('JORNADA_LV_COMIDA_FIN', '15:00'),
+
+  JORNADA_SABADO_INICIO: optional('JORNADA_SABADO_INICIO', '09:00'),
+  JORNADA_SABADO_FIN: optional('JORNADA_SABADO_FIN', '18:00'),
+  JORNADA_SABADO_COMIDA_INICIO: optional('JORNADA_SABADO_COMIDA_INICIO', '14:30'),
+  JORNADA_SABADO_COMIDA_FIN: optional('JORNADA_SABADO_COMIDA_FIN', '15:30'),
+
   DB_CONNECTION_LIMIT: numberEnv('DB_CONNECTION_LIMIT', 10),
   DB_MAX_IDLE: numberEnv('DB_MAX_IDLE', 5),
   DB_IDLE_TIMEOUT: numberEnv('DB_IDLE_TIMEOUT', 60000),
@@ -73,7 +83,7 @@ export const env = {
   RATE_LIMIT_EXPORT_WINDOW_MS: numberEnv('RATE_LIMIT_EXPORT_WINDOW_MS', 15 * 60 * 1000),
   RATE_LIMIT_EXPORT_MAX: numberEnv('RATE_LIMIT_EXPORT_MAX', 500),
 
-  BODY_LIMIT: optional('BODY_LIMIT', '5mb')
+  BODY_LIMIT: optional('BODY_LIMIT', '5mb'),
 };
 export function getAllowedOrigins() {
   return env.CORS_ORIGIN
