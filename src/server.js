@@ -29,6 +29,7 @@ import reporteGrupalRoutes from './routes/reporteGrupal.routes.js';
 import concentradosRoutes from './routes/concentrados.routes.js';
 import comparativoRoutes from './routes/comparativo.routes.js';
 import dashboardRoutes from './routes/dashboard.routes.js';
+import productividadMetricasRoutes from './routes/productividadMetricas.routes.js';
 import exportacionesRoutes from './routes/exportaciones.routes.js';
 import auditoriaRoutes from './routes/auditoria.routes.js';
 
@@ -127,6 +128,7 @@ app.use('/api/productividad/reporte-grupal', reporteGrupalRoutes);
 app.use('/api/productividad/concentrados', concentradosRoutes);
 app.use('/api/productividad/comparativo', comparativoRoutes);
 app.use('/api/productividad/dashboard', dashboardRoutes);
+app.use('/api/productividad/metricas', productividadMetricasRoutes);
 app.use('/api/productividad/exportar', exportacionesRoutes);
 app.use('/api/auditoria', auditoriaRoutes);
 
