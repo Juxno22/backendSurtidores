@@ -76,3 +76,29 @@ export async function authMiddleware(req, res, next) {
     });
   }
 }
+
+export function requireRoles(...rolesPermitidos) {
+  return function requireRolesMiddleware(req, res, next) {
+    if (!req.user) {
+      return res.status(401).json({
+        ok: false,
+        message: 'Sesión requerida'
+      });
+    }
+
+    const rolUsuario = String(req.user.rol || '').toUpperCase();
+
+    const rolesNormalizados = rolesPermitidos.map((rol) =>
+      String(rol || '').toUpperCase()
+    );
+
+    if (!rolesNormalizados.includes(rolUsuario)) {
+      return res.status(403).json({
+        ok: false,
+        message: 'No tienes permisos para realizar esta acción'
+      });
+    }
+
+    next();
+  };
+}
