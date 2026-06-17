@@ -33,6 +33,7 @@ import auditoriaRoutes from './routes/auditoria.routes.js';
 import checadoresRoutes from './routes/checadores.routes.js';
 import productividadDetalleRoutes from './routes/productividadDetalle.routes.js';
 import productividadMantenimientoRoutes from './routes/productividadMantenimiento.routes.js';
+import productividadIntegralRoutes from './routes/productividadIntegral.routes.js';
 
 const app = express();
 
@@ -134,6 +135,7 @@ app.use('/api/productividad/exportar', exportacionesRoutes);
 app.use('/api/checadores', checadoresRoutes);
 app.use('/api/auditoria', auditoriaRoutes);
 app.use('/api/productividad/detalle', productividadDetalleRoutes);
+app.use('/api/productividad/integral', productividadIntegralRoutes);
 app.use('/api/productividad/mantenimiento', productividadMantenimientoRoutes);
 
 app.use(notFoundMiddleware);

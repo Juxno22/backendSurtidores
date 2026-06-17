@@ -3,6 +3,7 @@ import {
   listarChecadores,
   crearChecador,
   actualizarChecador,
+  vincularChecadoresUsuarios,
   importarReporteChecadoresExcel,
   dashboardChecadores,
   listarReportesChecadores
@@ -22,6 +23,7 @@ router.use(requireRoles('ADMIN', 'SUPERVISOR'));
 
 router.get('/', listarChecadores);
 router.post('/', requireRoles('ADMIN'), crearChecador);
+router.post('/vincular-usuarios', requireRoles('ADMIN'), vincularChecadoresUsuarios);
 router.get('/detalle', listarDetalleChecadores);
 router.get('/detalle/:id', obtenerDetalleChecador);
 router.patch('/:id', requireRoles('ADMIN'), actualizarChecador);

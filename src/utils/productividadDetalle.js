@@ -139,15 +139,24 @@ export function construirDetalleSurtidores(rows = []) {
       row.hora_inicio &&
       previous.fecha_operativa === row.fecha_operativa
     ) {
-      tiempoMuertoAnteriorSegundos = getSegundosLaboralesEntre(
+      const gap = getSegundosLaboralesEntre(
         previous.hora_fin,
         row.hora_inicio
       );
+
+      tiempoMuertoAnteriorSegundos = Math.max(0, gap);
     }
 
     const sesion = calcularMetricasSesion(row, tiempoMuertoAnteriorSegundos);
 
-    previousBySurtidor.set(row.surtidor_id, sesion);
+    const sesionValidaParaSecuencia =
+      sesion.hora_inicio &&
+      sesion.hora_fin &&
+      sesion.duracion_segundos > 0;
+
+    if (sesionValidaParaSecuencia) {
+      previousBySurtidor.set(row.surtidor_id, sesion);
+    }
 
     if (!summaryBySurtidor.has(row.surtidor_id)) {
       summaryBySurtidor.set(row.surtidor_id, {

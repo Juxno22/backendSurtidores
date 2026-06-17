@@ -1,12 +1,55 @@
-import bcrypt from 'bcryptjs';
 import { pool } from '../config/db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { registrarAuditoria } from '../utils/auditoria.js';
+
+function toPositiveId(value, fieldName) {
+  const id = Number(value);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    const error = new Error(`${fieldName} inválido`);
+    error.status = 400;
+    throw error;
+  }
+
+  return id;
+}
+
+function normalizarCodigo(value) {
+  const text = String(value ?? '').trim().toUpperCase();
+  return text || null;
+}
+
+async function obtenerSurtidorPorId(connection, id) {
+  const [rows] = await connection.query(
+    `
+    SELECT
+      su.id,
+      su.usuario_id,
+      su.codigo,
+      su.activo,
+      u.nombre,
+      u.usuario,
+      u.rol,
+      u.activo AS usuario_activo,
+      u.ultimo_login,
+      DATE_FORMAT(su.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(su.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
+    FROM surtidores su
+    INNER JOIN usuarios u ON u.id = su.usuario_id
+    WHERE su.id = ?
+    LIMIT 1
+    `,
+    [id]
+  );
+
+  return rows[0] || null;
+}
 
 export const listarSurtidores = asyncHandler(async (req, res) => {
   const { activo, search } = req.query;
 
-  const where = ['u.rol = ?'];
-  const params = ['SURTIDOR'];
+  const where = [];
+  const params = [];
 
   if (activo !== undefined && activo !== '') {
     where.push('su.activo = ?');
@@ -14,8 +57,9 @@ export const listarSurtidores = asyncHandler(async (req, res) => {
   }
 
   if (search && search.trim()) {
-    where.push('(u.nombre LIKE ? OR u.usuario LIKE ? OR su.codigo LIKE ?)');
+    where.push('(u.nombre LIKE ? OR u.usuario LIKE ? OR u.rol LIKE ? OR su.codigo LIKE ?)');
     params.push(
+      `%${search.trim()}%`,
       `%${search.trim()}%`,
       `%${search.trim()}%`,
       `%${search.trim()}%`
@@ -29,153 +73,101 @@ export const listarSurtidores = asyncHandler(async (req, res) => {
       su.usuario_id,
       su.codigo,
       su.activo,
-
       u.nombre,
       u.usuario,
       u.rol,
+      u.activo AS usuario_activo,
       u.ultimo_login,
-
-      su.created_at,
-      su.updated_at
+      DATE_FORMAT(su.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(su.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
     FROM surtidores su
     INNER JOIN usuarios u ON u.id = su.usuario_id
-    WHERE ${where.join(' AND ')}
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY su.activo DESC, u.nombre ASC
     `,
     params
   );
 
-  res.json({
-    ok: true,
-    surtidores
-  });
+  res.json({ ok: true, surtidores });
 });
 
 export const crearSurtidor = asyncHandler(async (req, res) => {
-  const nombre = String(req.body.nombre || '').trim();
-  const usuario = String(req.body.usuario || '').trim();
-  const password = String(req.body.password || '');
-  const codigo = req.body.codigo !== undefined && req.body.codigo !== null
-    ? String(req.body.codigo).trim()
-    : null;
-
-  if (!nombre) {
-    return res.status(400).json({
-      ok: false,
-      message: 'El nombre del surtidor es obligatorio'
-    });
-  }
-
-  if (!usuario) {
-    return res.status(400).json({
-      ok: false,
-      message: 'El usuario del surtidor es obligatorio'
-    });
-  }
-
-  if (!password || password.length < 6) {
-    return res.status(400).json({
-      ok: false,
-      message: 'La contraseña debe tener al menos 6 caracteres'
-    });
-  }
+  const usuarioId = toPositiveId(req.body.usuario_id, 'usuario_id');
+  const codigo = normalizarCodigo(req.body.codigo);
+  const activo = req.body.activo !== undefined ? (Number(req.body.activo) === 1 ? 1 : 0) : 1;
 
   const connection = await pool.getConnection();
 
   try {
     await connection.beginTransaction();
 
-    const [usuarioExistente] = await connection.query(
-      'SELECT id FROM usuarios WHERE usuario = ? LIMIT 1',
-      [usuario]
+    const [usuarioRows] = await connection.query(
+      `
+      SELECT id, nombre, usuario, rol, activo
+      FROM usuarios
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [usuarioId]
     );
 
-    if (usuarioExistente.length > 0) {
+    if (!usuarioRows.length) {
       await connection.rollback();
+      return res.status(404).json({ ok: false, message: 'Usuario no encontrado. Primero créalo desde Usuarios.' });
+    }
 
-      return res.status(409).json({
-        ok: false,
-        message: 'Ya existe un usuario con ese nombre de acceso'
-      });
+    const usuario = usuarioRows[0];
+
+    if (Number(usuario.activo) !== 1) {
+      await connection.rollback();
+      return res.status(400).json({ ok: false, message: 'No puedes vincular un usuario inactivo como surtidor.' });
+    }
+
+    const [yaSurtidor] = await connection.query(
+      `SELECT id FROM surtidores WHERE usuario_id = ? LIMIT 1`,
+      [usuarioId]
+    );
+
+    if (yaSurtidor.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ ok: false, message: 'Ese usuario ya está vinculado como surtidor.' });
     }
 
     if (codigo) {
       const [codigoExistente] = await connection.query(
-        'SELECT id FROM surtidores WHERE codigo = ? LIMIT 1',
+        `SELECT id FROM surtidores WHERE codigo = ? LIMIT 1`,
         [codigo]
       );
 
       if (codigoExistente.length > 0) {
         await connection.rollback();
-
-        return res.status(409).json({
-          ok: false,
-          message: 'Ya existe un surtidor con ese código'
-        });
+        return res.status(409).json({ ok: false, message: 'Ya existe un surtidor con ese código.' });
       }
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const [usuarioResult] = await connection.query(
+    const [result] = await connection.query(
       `
-      INSERT INTO usuarios (
-        nombre,
-        usuario,
-        password_hash,
-        rol,
-        sucursal_id,
-        activo
-      )
-      VALUES (?, ?, ?, 'SURTIDOR', NULL, 1)
+      INSERT INTO surtidores (usuario_id, codigo, activo)
+      VALUES (?, ?, ?)
       `,
-      [nombre, usuario, passwordHash]
+      [usuarioId, codigo, activo]
     );
 
-    const usuarioId = usuarioResult.insertId;
+    const nuevo = await obtenerSurtidorPorId(connection, result.insertId);
 
-    const [surtidorResult] = await connection.query(
-      `
-      INSERT INTO surtidores (
-        usuario_id,
-        codigo,
-        activo
-      )
-      VALUES (?, ?, 1)
-      `,
-      [usuarioId, codigo || null]
-    );
+    await registrarAuditoria(connection, {
+      req,
+      modulo: 'SURTIDORES',
+      accion: 'VINCULAR_USUARIO_SURTIDOR',
+      entidad: 'surtidores',
+      entidadId: result.insertId,
+      datosAntes: null,
+      datosDespues: nuevo
+    });
 
     await connection.commit();
 
-    const [nuevo] = await pool.query(
-      `
-      SELECT
-        su.id,
-        su.usuario_id,
-        su.codigo,
-        su.activo,
-
-        u.nombre,
-        u.usuario,
-        u.rol,
-        u.ultimo_login,
-
-        su.created_at,
-        su.updated_at
-      FROM surtidores su
-      INNER JOIN usuarios u ON u.id = su.usuario_id
-      WHERE su.id = ?
-      LIMIT 1
-      `,
-      [surtidorResult.insertId]
-    );
-
-    res.status(201).json({
-      ok: true,
-      message: 'Surtidor creado correctamente',
-      surtidor: nuevo[0]
-    });
+    res.status(201).json({ ok: true, message: 'Usuario vinculado como surtidor correctamente', surtidor: nuevo });
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -185,202 +177,58 @@ export const crearSurtidor = asyncHandler(async (req, res) => {
 });
 
 export const actualizarSurtidor = asyncHandler(async (req, res) => {
-  const id = Number(req.params.id);
-
-  if (!Number.isInteger(id) || id <= 0) {
-    return res.status(400).json({
-      ok: false,
-      message: 'ID de surtidor inválido'
-    });
-  }
-
+  const id = toPositiveId(req.params.id, 'ID de surtidor');
   const connection = await pool.getConnection();
 
   try {
     await connection.beginTransaction();
 
-    const [actualRows] = await connection.query(
-      `
-      SELECT
-        su.id,
-        su.usuario_id,
-        su.codigo,
-        su.activo,
+    const actual = await obtenerSurtidorPorId(connection, id);
 
-        u.nombre,
-        u.usuario,
-        u.rol
-      FROM surtidores su
-      INNER JOIN usuarios u ON u.id = su.usuario_id
-      WHERE su.id = ?
-        AND u.rol = 'SURTIDOR'
-      LIMIT 1
-      `,
-      [id]
-    );
-
-    if (actualRows.length === 0) {
+    if (!actual) {
       await connection.rollback();
-
-      return res.status(404).json({
-        ok: false,
-        message: 'Surtidor no encontrado'
-      });
+      return res.status(404).json({ ok: false, message: 'Surtidor no encontrado' });
     }
 
-    const actual = actualRows[0];
-
-    const nombre = req.body.nombre !== undefined
-      ? String(req.body.nombre || '').trim()
-      : actual.nombre;
-
-    const usuario = req.body.usuario !== undefined
-      ? String(req.body.usuario || '').trim()
-      : actual.usuario;
-
-    const codigo = req.body.codigo !== undefined
-      ? String(req.body.codigo || '').trim()
-      : actual.codigo;
-
-    const activo = req.body.activo !== undefined
-      ? (Number(req.body.activo) === 1 ? 1 : 0)
-      : actual.activo;
-
-    const password = req.body.password !== undefined
-      ? String(req.body.password || '')
-      : null;
-
-    if (!nombre) {
-      await connection.rollback();
-
-      return res.status(400).json({
-        ok: false,
-        message: 'El nombre del surtidor no puede ir vacío'
-      });
-    }
-
-    if (!usuario) {
-      await connection.rollback();
-
-      return res.status(400).json({
-        ok: false,
-        message: 'El usuario del surtidor no puede ir vacío'
-      });
-    }
-
-    if (password !== null && password.length > 0 && password.length < 6) {
-      await connection.rollback();
-
-      return res.status(400).json({
-        ok: false,
-        message: 'La nueva contraseña debe tener al menos 6 caracteres'
-      });
-    }
-
-    if (usuario !== actual.usuario) {
-      const [usuarioDuplicado] = await connection.query(
-        'SELECT id FROM usuarios WHERE usuario = ? AND id <> ? LIMIT 1',
-        [usuario, actual.usuario_id]
-      );
-
-      if (usuarioDuplicado.length > 0) {
-        await connection.rollback();
-
-        return res.status(409).json({
-          ok: false,
-          message: 'Ya existe otro usuario con ese nombre de acceso'
-        });
-      }
-    }
+    const codigo = req.body.codigo !== undefined ? normalizarCodigo(req.body.codigo) : actual.codigo;
+    const activo = req.body.activo !== undefined ? (Number(req.body.activo) === 1 ? 1 : 0) : actual.activo;
 
     if (codigo) {
       const [codigoDuplicado] = await connection.query(
-        'SELECT id FROM surtidores WHERE codigo = ? AND id <> ? LIMIT 1',
+        `SELECT id FROM surtidores WHERE codigo = ? AND id <> ? LIMIT 1`,
         [codigo, id]
       );
 
       if (codigoDuplicado.length > 0) {
         await connection.rollback();
-
-        return res.status(409).json({
-          ok: false,
-          message: 'Ya existe otro surtidor con ese código'
-        });
+        return res.status(409).json({ ok: false, message: 'Ya existe otro surtidor con ese código.' });
       }
-    }
-
-    if (password && password.length >= 6) {
-      const passwordHash = await bcrypt.hash(password, 10);
-
-      await connection.query(
-        `
-        UPDATE usuarios
-        SET
-          nombre = ?,
-          usuario = ?,
-          password_hash = ?,
-          sucursal_id = NULL,
-          activo = ?
-        WHERE id = ?
-        `,
-        [nombre, usuario, passwordHash, activo, actual.usuario_id]
-      );
-    } else {
-      await connection.query(
-        `
-        UPDATE usuarios
-        SET
-          nombre = ?,
-          usuario = ?,
-          sucursal_id = NULL,
-          activo = ?
-        WHERE id = ?
-        `,
-        [nombre, usuario, activo, actual.usuario_id]
-      );
     }
 
     await connection.query(
       `
       UPDATE surtidores
-      SET
-        codigo = ?,
-        activo = ?
+      SET codigo = ?, activo = ?
       WHERE id = ?
       `,
-      [codigo || null, activo, id]
+      [codigo, activo, id]
     );
+
+    const actualizado = await obtenerSurtidorPorId(connection, id);
+
+    await registrarAuditoria(connection, {
+      req,
+      modulo: 'SURTIDORES',
+      accion: 'ACTUALIZAR_SURTIDOR',
+      entidad: 'surtidores',
+      entidadId: id,
+      datosAntes: actual,
+      datosDespues: actualizado
+    });
 
     await connection.commit();
 
-    const [actualizado] = await pool.query(
-      `
-      SELECT
-        su.id,
-        su.usuario_id,
-        su.codigo,
-        su.activo,
-
-        u.nombre,
-        u.usuario,
-        u.rol,
-        u.ultimo_login,
-
-        su.created_at,
-        su.updated_at
-      FROM surtidores su
-      INNER JOIN usuarios u ON u.id = su.usuario_id
-      WHERE su.id = ?
-      LIMIT 1
-      `,
-      [id]
-    );
-
-    res.json({
-      ok: true,
-      message: 'Surtidor actualizado correctamente',
-      surtidor: actualizado[0]
-    });
+    res.json({ ok: true, message: 'Surtidor actualizado correctamente', surtidor: actualizado });
   } catch (error) {
     await connection.rollback();
     throw error;

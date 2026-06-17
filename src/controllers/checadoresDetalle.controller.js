@@ -13,18 +13,17 @@ function getDateFilters(query) {
   const desde = query.desde || fecha || today;
   const hasta = query.hasta || fecha || desde;
 
-  return {
-    fecha,
-    desde,
-    hasta
-  };
+  return { fecha, desde, hasta };
 }
 
 function buildWhere(query) {
   const { desde, hasta } = getDateFilters(query);
 
   const where = [
-    'cr.fecha BETWEEN ? AND ?'
+    'cr.fecha BETWEEN ? AND ?',
+    'c.usuario_id IS NOT NULL',
+    'c.activo = 1',
+    'u.activo = 1'
   ];
 
   const params = [desde, hasta];
@@ -37,11 +36,7 @@ function buildWhere(query) {
   return {
     whereSql: where.join(' AND '),
     params,
-    filtros: {
-      desde,
-      hasta,
-      checador_id: query.checador_id || ''
-    }
+    filtros: { desde, hasta, checador_id: query.checador_id || '' }
   };
 }
 
@@ -53,38 +48,36 @@ async function getRegistrosChecadores(query) {
     SELECT
       cr.id,
       cr.checador_id,
-
-      c.nombre AS checador_nombre,
-      c.id AS checador_codigo,
-
+      c.usuario_id,
+      COALESCE(u.nombre, c.nombre, c.nombre_reporte, cr.checador_nombre_reporte) AS checador_nombre,
+      c.codigo_reporte AS checador_codigo,
+      u.usuario,
+      st.id AS surtidor_id,
+      st.codigo AS surtidor_codigo,
       DATE_FORMAT(cr.fecha, '%Y-%m-%d') AS fecha,
-
       cr.num_salida,
       cr.est,
       cr.num_requisicion,
       cr.observaciones,
       cr.tp,
       cr.total,
-
       DATE_FORMAT(cr.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
       DATE_FORMAT(cr.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
     FROM checadores_reportes cr
     INNER JOIN checadores c ON c.id = cr.checador_id
+    INNER JOIN usuarios u ON u.id = c.usuario_id
+    LEFT JOIN surtidores st ON st.usuario_id = u.id
     WHERE ${whereSql}
-    ORDER BY cr.fecha ASC, c.nombre ASC, cr.num_salida ASC
+    ORDER BY cr.fecha ASC, checador_nombre ASC, cr.num_salida ASC
     `,
     params
   );
 
-  return {
-    filtros,
-    rows
-  };
+  return { filtros, rows };
 }
 
 export const listarDetalleChecadores = asyncHandler(async (req, res) => {
   const { filtros, rows } = await getRegistrosChecadores(req.query);
-
   const detalle = construirDetalleChecadores(rows);
 
   res.json({
@@ -97,13 +90,8 @@ export const listarDetalleChecadores = asyncHandler(async (req, res) => {
 });
 
 export const obtenerDetalleChecador = asyncHandler(async (req, res) => {
-  const query = {
-    ...req.query,
-    checador_id: req.params.id
-  };
-
+  const query = { ...req.query, checador_id: req.params.id };
   const { filtros, rows } = await getRegistrosChecadores(query);
-
   const detalle = construirDetalleChecadores(rows);
   const checador = detalle.ranking[0] || null;
 

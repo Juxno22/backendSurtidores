@@ -777,7 +777,12 @@ export const exportarChecadores = asyncHandler(async (req, res) => {
   const checadorId = toPositiveIdOptional(req.query.checador_id, 'checador_id');
   const limit = safeLimit(req.query.limit, 10000, 50000);
 
-  const where = ['cr.fecha BETWEEN ? AND ?'];
+  const where = [
+    'cr.fecha BETWEEN ? AND ?',
+    'c.usuario_id IS NOT NULL',
+    'c.activo = 1',
+    'u.activo = 1'
+  ];
   const params = [desde, hasta];
 
   if (checadorId) {
@@ -800,7 +805,7 @@ export const exportarChecadores = asyncHandler(async (req, res) => {
       GROUP_CONCAT(DISTINCT DATE_FORMAT(cr.fecha, '%Y-%m-%d') ORDER BY cr.fecha SEPARATOR ',') AS fechas
     FROM checadores_reportes cr
     INNER JOIN checadores c ON c.id = cr.checador_id
-    LEFT JOIN usuarios u ON u.id = c.usuario_id
+    INNER JOIN usuarios u ON u.id = c.usuario_id
     WHERE ${whereSql}
     GROUP BY c.id, c.codigo_reporte, checador_nombre
     ORDER BY tp DESC, salidas DESC
@@ -842,6 +847,8 @@ export const exportarChecadores = asyncHandler(async (req, res) => {
       COALESCE(SUM(cr.total), 0) AS total_importe,
       COUNT(DISTINCT cr.checador_id) AS checadores_activos
     FROM checadores_reportes cr
+    INNER JOIN checadores c ON c.id = cr.checador_id
+    INNER JOIN usuarios u ON u.id = c.usuario_id
     WHERE ${whereSql}
     GROUP BY cr.fecha
     ORDER BY cr.fecha ASC
@@ -882,7 +889,7 @@ export const exportarChecadores = asyncHandler(async (req, res) => {
       DATE_FORMAT(cr.created_at, '%Y-%m-%d %H:%i:%s') AS created_at
     FROM checadores_reportes cr
     INNER JOIN checadores c ON c.id = cr.checador_id
-    LEFT JOIN usuarios u ON u.id = c.usuario_id
+    INNER JOIN usuarios u ON u.id = c.usuario_id
     WHERE ${whereSql}
     ORDER BY cr.fecha DESC, cr.id DESC
     LIMIT ?
