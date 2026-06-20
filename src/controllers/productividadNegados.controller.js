@@ -209,7 +209,7 @@ export const listarNegados = asyncHandler(async (req, res) => {
     LEFT JOIN sucursales sc ON sc.id = ps.sucursal_id
     LEFT JOIN usuarios ur ON ur.id = n.revisado_por
     WHERE ${whereSql}
-    ORDER BY n.fecha_operativa DESC, n.created_at DESC, n.id DESC
+    ORDER BY n.codigo_producto ASC, n.linea ASC, n.fecha_operativa DESC, n.created_at DESC, n.id DESC
     LIMIT ${limit}
     `,
     params

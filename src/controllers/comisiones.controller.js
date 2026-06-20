@@ -5,6 +5,9 @@ import { getNowMexicoDateTime } from '../utils/mexicoTime.js';
 import { getJornadaDisponibleSegundosPorFechas } from '../utils/productividadDetalle.js';
 
 const BASE_COMISION = 2000;
+const EFECTIVIDAD_MINIMA_PCT = 90;
+const LIMITE_NEGADOS_PENALIZABLES_RATIO = 0.01;
+const SEGUNDOS_JORNADA_COMPLETA = 8 * 3600;
 
 const PESOS = {
   SURTIDOR_SUCURSAL: {
@@ -84,6 +87,18 @@ function clamp01(value) {
   return number;
 }
 
+function cumpleEfectividadMinima(efectividadPct) {
+  return toNumber(efectividadPct) > EFECTIVIDAD_MINIMA_PCT;
+}
+
+function excedeLimiteNegadosPenalizables(negadosPenalizables, surtidoBase) {
+  const base = toNumber(surtidoBase);
+
+  if (base <= 0) return false;
+
+  return toNumber(negadosPenalizables) > (base * LIMITE_NEGADOS_PENALIZABLES_RATIO);
+}
+
 function uniqueDatesFromCsv(csv) {
   return String(csv || '')
     .split(',')
@@ -150,11 +165,19 @@ function buildBloqueos({ negadosPendientes = 0, incidencias = null, extra = [] }
     });
   }
 
-  if (incidencias?.bloqueantes) {
+  if (incidencias && hasIncidencia(incidencias, 'ASISTENCIA')) {
     bloqueos.push({
-      codigo: 'INCIDENCIAS_BLOQUEANTES',
-      message: 'Hay incidencias operativas bloqueantes',
-      cantidad: toNumber(incidencias.bloqueantes)
+      codigo: 'INASISTENCIA_INJUSTIFICADA',
+      message: 'Bono bloqueado por inasistencia injustificada',
+      cantidad: Number(incidencias.por_tipo?.ASISTENCIA || 0)
+    });
+  }
+
+  if (incidencias && hasIncidencia(incidencias, 'MAL_EMPAQUE')) {
+    bloqueos.push({
+      codigo: 'MAL_EMPAQUE',
+      message: 'Bono bloqueado por incidencia de mal empaque',
+      cantidad: Number(incidencias.por_tipo?.MAL_EMPAQUE || 0)
     });
   }
 
@@ -401,17 +424,21 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
     const incidencias = getIncidenciasFor(incidenciasMap, row.usuario_id, 'SURTIDOR_SUCURSAL');
     const surtidoTotal = toNumber(row.surtido_total);
     const partidas = toNumber(row.partidas_surtidas);
-    const efectividadPct = percent(partidas, surtidoTotal);
     const negadosPenalizables = toNumber(negados.negados_penalizables);
+    const baseEfectividad = partidas + negadosPenalizables;
+    const efectividadPct = baseEfectividad ? percent(partidas, baseEfectividad) : 0;
+    const cumpleEfectividad = cumpleEfectividadMinima(efectividadPct);
+    const surtidoBaseNegados = Math.max(surtidoTotal, baseEfectividad);
+    const negadosExcedenLimite = excedeLimiteNegadosPenalizables(negadosPenalizables, surtidoBaseNegados);
     const fechas = uniqueDatesFromCsv(row.fechas);
     const jornadaSegundos = getJornadaDisponibleSegundosPorFechas(fechas, 'SUCURSAL');
 
     const desglose = {
       efectividad: {
-        label: 'Efectividad individual',
+        label: 'Efectividad individual > 90%',
         peso: PESOS.SURTIDOR_SUCURSAL.efectividad,
         valor: efectividadPct,
-        monto: round2(PESOS.SURTIDOR_SUCURSAL.efectividad * clamp01(efectividadPct / 100))
+        monto: cumpleEfectividad ? PESOS.SURTIDOR_SUCURSAL.efectividad : 0
       },
       no_surtido: {
         label: 'No surtido / negados penalizables',
@@ -451,18 +478,26 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
         negados_capturados: toNumber(row.negados_capturados),
         surtido_total: surtidoTotal,
         efectividad_pct: efectividadPct,
+        cumple_efectividad_minima: cumpleEfectividad,
+        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}%`,
         tiempo_activo_segundos: toNumber(row.tiempo_activo_segundos),
         jornada_disponible_segundos: jornadaSegundos,
         partidas_por_hora_jornada: jornadaSegundos ? round2(partidas / (jornadaSegundos / 3600)) : 0,
         negados_pendientes: toNumber(negados.negados_pendientes),
         negados_penalizables: negadosPenalizables,
         negados_no_penalizan: toNumber(negados.negados_no_penalizan),
+        negados_limite_excedido: negadosExcedenLimite,
         incidencias
       },
       desglose,
       bloqueos: buildBloqueos({
         negadosPendientes: negados.negados_pendientes,
-        incidencias
+        incidencias,
+        extra: negadosExcedenLimite ? [{
+          codigo: 'NEGADOS_LIMITE_EXCEDIDO',
+          message: 'Bono bloqueado por negados penalizables excedidos',
+          cantidad: negadosPenalizables
+        }] : []
       })
     });
   });
@@ -655,11 +690,16 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
   const baseRows = produccionRows.map((row) => {
     const sesiones = sesionesMap.get(Number(row.usuario_id)) || {};
     const negados = negadosMap.get(Number(row.usuario_id)) || {};
-    const partidasNetas = Math.max(0, toNumber(row.partidas_oficiales) - toNumber(negados.negados_penalizables));
+    const partidasOficiales = toNumber(row.partidas_oficiales);
+    const negadosPenalizables = toNumber(negados.negados_penalizables);
+    const partidasNetas = Math.max(0, partidasOficiales - negadosPenalizables);
+    const efectividadPct = partidasOficiales ? percent(partidasNetas, partidasOficiales) : 0;
+    const cumpleEfectividad = cumpleEfectividadMinima(efectividadPct);
+    const negadosExcedenLimite = excedeLimiteNegadosPenalizables(negadosPenalizables, partidasOficiales);
     const tiempoActivo = toNumber(sesiones.tiempo_activo_segundos);
     const horasActivas = tiempoActivo / 3600;
     const fechasReporte = uniqueDatesFromCsv(row.fechas_reporte);
-    const jornadaReporteSegundos = getJornadaDisponibleSegundosPorFechas(fechasReporte, 'MAYOREO');
+    const jornadaReporteSegundos = fechasReporte.length * SEGUNDOS_JORNADA_COMPLETA;
     const horasReporte = jornadaReporteSegundos / 3600;
     const modoProductividad = tiempoActivo > 0 ? 'APP_TIEMPO_REAL' : 'REPORTE_JORNADA';
     const partidasHoraActiva = horasActivas ? partidasNetas / horasActivas : 0;
@@ -677,8 +717,11 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
       modo_productividad: modoProductividad,
       negados_pendientes: toNumber(negados.negados_pendientes),
       negados_no_penalizan: toNumber(negados.negados_no_penalizan),
-      negados_penalizables: toNumber(negados.negados_penalizables),
+      negados_penalizables: negadosPenalizables,
       partidas_netas: partidasNetas,
+      efectividad_pct: efectividadPct,
+      cumple_efectividad_minima: cumpleEfectividad,
+      negados_limite_excedido: negadosExcedenLimite,
       partidas_netas_por_hora_activa: partidasHoraActiva,
       partidas_netas_por_hora_reporte: partidasHoraReporte,
       partidas_netas_por_hora_calculo: modoProductividad === 'APP_TIEMPO_REAL' ? partidasHoraActiva : partidasHoraReporte
@@ -698,25 +741,25 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
         label: 'Partidas netas',
         peso: PESOS.SURTIDOR_MAYOREO.partidas_netas,
         valor: row.partidas_netas,
-        monto: maxPartidasNetas ? round2(PESOS.SURTIDOR_MAYOREO.partidas_netas * clamp01(row.partidas_netas / maxPartidasNetas)) : 0
+        monto: row.cumple_efectividad_minima && maxPartidasNetas ? round2(PESOS.SURTIDOR_MAYOREO.partidas_netas * clamp01(row.partidas_netas / maxPartidasNetas)) : 0
       },
       partidas_hora: {
         label: row.modo_productividad === 'APP_TIEMPO_REAL' ? 'Partidas netas / hora activa' : 'Partidas netas / jornada reporte',
         peso: PESOS.SURTIDOR_MAYOREO.partidas_hora,
         valor: round2(row.partidas_netas_por_hora_calculo),
-        monto: maxPartidasHora ? round2(PESOS.SURTIDOR_MAYOREO.partidas_hora * clamp01(row.partidas_netas_por_hora_calculo / maxPartidasHora)) : 0
+        monto: row.cumple_efectividad_minima && maxPartidasHora ? round2(PESOS.SURTIDOR_MAYOREO.partidas_hora * clamp01(row.partidas_netas_por_hora_calculo / maxPartidasHora)) : 0
       },
       tickets: {
         label: 'Tickets',
         peso: PESOS.SURTIDOR_MAYOREO.tickets,
         valor: toNumber(row.tickets),
-        monto: maxTickets ? round2(PESOS.SURTIDOR_MAYOREO.tickets * clamp01(toNumber(row.tickets) / maxTickets)) : 0
+        monto: row.cumple_efectividad_minima && maxTickets ? round2(PESOS.SURTIDOR_MAYOREO.tickets * clamp01(toNumber(row.tickets) / maxTickets)) : 0
       },
       neto: {
         label: 'Neto',
         peso: PESOS.SURTIDOR_MAYOREO.neto,
         valor: round2(row.neto),
-        monto: maxNeto ? round2(PESOS.SURTIDOR_MAYOREO.neto * clamp01(toNumber(row.neto) / maxNeto)) : 0
+        monto: row.cumple_efectividad_minima && maxNeto ? round2(PESOS.SURTIDOR_MAYOREO.neto * clamp01(toNumber(row.neto) / maxNeto)) : 0
       },
       negados: {
         label: 'Negados penalizables',
@@ -740,9 +783,13 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
         movimientos: toNumber(row.movimientos),
         tickets: toNumber(row.tickets),
         partidas_oficiales: toNumber(row.partidas_oficiales),
+        efectividad_pct: row.efectividad_pct,
+        cumple_efectividad_minima: row.cumple_efectividad_minima,
+        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}%`,
         negados_penalizables: row.negados_penalizables,
         negados_no_penalizan: row.negados_no_penalizan,
         negados_pendientes: row.negados_pendientes,
+        negados_limite_excedido: row.negados_limite_excedido,
         partidas_netas: row.partidas_netas,
         neto: round2(row.neto),
         sesiones: row.sesiones,
@@ -763,7 +810,12 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
       desglose,
       bloqueos: buildBloqueos({
         negadosPendientes: row.negados_pendientes,
-        incidencias
+        incidencias,
+        extra: row.negados_limite_excedido ? [{
+          codigo: 'NEGADOS_LIMITE_EXCEDIDO',
+          message: 'Bono bloqueado por negados penalizables excedidos',
+          cantidad: row.negados_penalizables
+        }] : []
       })
     });
   });
@@ -1062,7 +1114,9 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
       pesos: PESOS,
       checadores_meta: 'total_partidas_surtidores_sucursales / total_horas_jornada_checadores_activos',
       mayoreo_partidas_netas: 'partidas_oficiales - negados_penalizables',
-      usuario_mixto: 'surtidor + checador se fusiona en una sola comisión con tope de $2,000',
+      usuario_mixto: 'surtidor + checador se fusiona en una sola comisión con tope de $2,000; cada función aporta 50% en escala',
+      efectividad_minima: `surtidores sucursal y mayoreo requieren más de ${EFECTIVIDAD_MINIMA_PCT}% para ganar la parte de productividad/efectividad`,
+      bloqueos_automaticos: 'inasistencia injustificada, mal empaque o negados penalizables excedidos dejan el bono en $0',
       encargado: 'comisiona si más del 50% del equipo combinado comisiona'
     },
     resumen,
