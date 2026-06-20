@@ -161,10 +161,25 @@ function buildBloqueos({ negadosPendientes = 0, incidencias = null, extra = [] }
   return [...bloqueos, ...extra];
 }
 
-function buildComision({ usuario, surtidorId = null, checadorId = null, tipoComision, metricas, desglose, bloqueos }) {
-  const montoAcumulado = Object.values(desglose || {}).reduce((acc, row) => acc + toNumber(row.monto), 0);
+function buildComision({
+  usuario,
+  surtidorId = null,
+  checadorId = null,
+  tipoComision,
+  metricas,
+  desglose,
+  bloqueos,
+  forceMontoAcumulado = null
+}) {
+  const montoAcumulado = forceMontoAcumulado ?? Object.values(desglose || {}).reduce((acc, row) => acc + toNumber(row.monto), 0);
   const bloqueado = bloqueos.length > 0;
-  const montoFinal = bloqueado ? 0 : montoAcumulado;
+
+  /*
+    Regla operativa:
+    Ningún usuario puede cobrar más de $2,000 en el periodo, aunque tenga
+    funciones combinadas como surtidor + checador.
+  */
+  const montoFinal = bloqueado ? 0 : Math.min(BASE_COMISION, montoAcumulado);
 
   return {
     usuario_id: usuario.usuario_id,
@@ -181,6 +196,116 @@ function buildComision({ usuario, surtidorId = null, checadorId = null, tipoComi
     comisiona: !bloqueado && montoFinal > 0,
     bloqueado
   };
+}
+
+function uniqueBloqueos(bloqueos = []) {
+  const map = new Map();
+
+  for (const bloqueo of bloqueos) {
+    const key = `${bloqueo.codigo || 'BLOQUEO'}:${bloqueo.message || ''}`;
+
+    if (!map.has(key)) {
+      map.set(key, {
+        ...bloqueo,
+        cantidad: toNumber(bloqueo.cantidad)
+      });
+      continue;
+    }
+
+    const actual = map.get(key);
+    actual.cantidad += toNumber(bloqueo.cantidad);
+  }
+
+  return [...map.values()];
+}
+
+function fusionarComisionesOperativas(comisionesBase = []) {
+  const byUsuario = new Map();
+
+  for (const item of comisionesBase) {
+    if (!byUsuario.has(item.usuario_id)) {
+      byUsuario.set(item.usuario_id, []);
+    }
+
+    byUsuario.get(item.usuario_id).push(item);
+  }
+
+  const fusionadas = [];
+
+  for (const items of byUsuario.values()) {
+    if (items.length === 1) {
+      const item = items[0];
+
+      fusionadas.push({
+        ...item,
+        monto_final: item.bloqueado ? 0 : round2(Math.min(BASE_COMISION, item.monto_acumulado)),
+        comisiona: !item.bloqueado && Math.min(BASE_COMISION, item.monto_acumulado) > 0
+      });
+
+      continue;
+    }
+
+    const usuarioBase = items[0];
+    const tipos = items.map((item) => item.tipo_comision);
+    const montoAcumulado = items.reduce((acc, item) => acc + toNumber(item.monto_acumulado), 0);
+    const bloqueos = uniqueBloqueos(items.flatMap((item) => item.bloqueos || []));
+    const bloqueado = bloqueos.length > 0;
+    const montoFinal = bloqueado ? 0 : Math.min(BASE_COMISION, montoAcumulado);
+
+    const desglose = {};
+
+    for (const item of items) {
+      desglose[item.tipo_comision] = {
+        label: item.tipo_comision,
+        peso: BASE_COMISION,
+        valor: round2(item.monto_acumulado),
+        monto: round2(item.monto_acumulado),
+        monto_final_individual: round2(item.monto_final),
+        bloqueado: item.bloqueado,
+        comisiona: item.comisiona,
+        desglose_original: item.desglose || {}
+      };
+    }
+
+    fusionadas.push({
+      usuario_id: usuarioBase.usuario_id,
+      usuario_nombre: usuarioBase.usuario_nombre,
+      usuario: usuarioBase.usuario,
+      surtidor_id: items.find((item) => item.surtidor_id)?.surtidor_id || null,
+      checador_id: items.find((item) => item.checador_id)?.checador_id || null,
+      tipo_comision: 'OPERATIVO_FUSIONADO',
+      metricas: {
+        regla: 'Usuario con más de una función operativa; se fusiona y el tope total del periodo es $2,000.',
+        tipos_comision: tipos,
+        componentes: items.map((item) => ({
+          tipo_comision: item.tipo_comision,
+          monto_acumulado: item.monto_acumulado,
+          monto_final_individual: item.monto_final,
+          comisiona: item.comisiona,
+          bloqueado: item.bloqueado,
+          metricas: item.metricas || {}
+        })),
+        monto_acumulado_componentes: round2(montoAcumulado),
+        tope_usuario: BASE_COMISION
+      },
+      desglose,
+      bloqueos,
+      monto_acumulado: round2(montoAcumulado),
+      monto_final: round2(montoFinal),
+      comisiona: !bloqueado && montoFinal > 0,
+      bloqueado
+    });
+  }
+
+  return fusionadas;
+}
+
+function comisionAplicaAEquipo(item, tiposEquipo = []) {
+  const tiposItem = item.tipo_comision === 'OPERATIVO_FUSIONADO'
+    ? item.metricas?.tipos_comision || []
+    : [item.tipo_comision];
+
+  return tiposItem.some((tipo) => tiposEquipo.includes(tipo));
 }
 
 async function getIncidenciasActivas(desde, hasta) {
@@ -643,7 +768,7 @@ async function calcularEncargados(incidenciasMap, comisionesBase) {
     if (Number(row.encargado_surtidores_mayoreo)) tiposEquipo.push('SURTIDOR_MAYOREO');
 
     const equipo = comisionesBase.filter((item) => {
-      return tiposEquipo.includes(item.tipo_comision) && item.usuario_id !== row.usuario_id;
+      return item.usuario_id !== row.usuario_id && comisionAplicaAEquipo(item, tiposEquipo);
     });
 
     const totalEquipo = equipo.length;
@@ -776,7 +901,7 @@ async function guardarCalculo(connection, req, { desde, hasta, motivo, resumen, 
   }
 
   await connection.query(
-  `DELETE FROM comisiones_individuales WHERE periodo_id = ? AND estado = 'BORRADOR'`,
+    "DELETE FROM comisiones_individuales WHERE periodo_id = ? AND estado = 'BORRADOR'",
     [periodoId]
   );
 
@@ -864,11 +989,13 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
   const checadoresSucursal = await calcularChecadoresSucursal(desde, hasta, incidenciasMap);
   const surtidoresMayoreo = await calcularSurtidoresMayoreo(desde, hasta, incidenciasMap);
 
-  const base = [
+  const componentesOperativos = [
     ...surtidoresSucursal,
     ...checadoresSucursal,
     ...surtidoresMayoreo
   ];
+
+  const base = fusionarComisionesOperativas(componentesOperativos);
 
   const encargados = await calcularEncargados(incidenciasMap, base);
   const comisiones = [...base, ...encargados];
@@ -909,6 +1036,7 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
       pesos: PESOS,
       checadores_meta: 'total_partidas_surtidores_sucursales / total_horas_jornada_checadores_activos',
       mayoreo_partidas_netas: 'partidas_oficiales - negados_penalizables',
+      usuario_mixto: 'surtidor + checador se fusiona en una sola comisión con tope de $2,000',
       encargado: 'comisiona si más del 50% del equipo combinado comisiona'
     },
     resumen,

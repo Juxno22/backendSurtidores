@@ -88,11 +88,61 @@ function excelSerialDateToYYYYMMDD(serial) {
   return date.toISOString().slice(0, 10);
 }
 
+function isValidDateParts(anio, mes, dia) {
+  const y = Number(anio);
+  const m = Number(mes);
+  const d = Number(dia);
+
+  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return false;
+  if (y < 2000 || y > 2100) return false;
+  if (m < 1 || m > 12) return false;
+  if (d < 1 || d > 31) return false;
+
+  const date = new Date(Date.UTC(y, m - 1, d));
+
+  return (
+    date.getUTCFullYear() === y &&
+    date.getUTCMonth() === m - 1 &&
+    date.getUTCDate() === d
+  );
+}
+
+function buildYYYYMMDD(anio, mes, dia, { allowSwap = true } = {}) {
+  const y = String(anio).padStart(4, '0');
+  const m = String(mes).padStart(2, '0');
+  const d = String(dia).padStart(2, '0');
+
+  if (isValidDateParts(y, m, d)) {
+    return `${y}-${m}-${d}`;
+  }
+
+  /*
+    Algunos reportes llegan con mes/día invertidos después de parsear Excel:
+    2026-13-06 realmente corresponde a 2026-06-13.
+    Lo corregimos solo cuando el mes es imposible y el día puede ser mes.
+  */
+  if (
+    allowSwap &&
+    Number(m) > 12 &&
+    Number(d) >= 1 &&
+    Number(d) <= 12 &&
+    isValidDateParts(y, d, m)
+  ) {
+    return `${y}-${d}-${m}`;
+  }
+
+  return null;
+}
+
 function convertirFecha(value) {
   if (!value) return null;
 
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value.toISOString().slice(0, 10);
+    return buildYYYYMMDD(
+      value.getFullYear(),
+      value.getMonth() + 1,
+      value.getDate()
+    );
   }
 
   if (typeof value === 'number') {
@@ -101,8 +151,10 @@ function convertirFecha(value) {
 
   const raw = String(value).trim();
 
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return raw;
+  const exactYMD = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+
+  if (exactYMD) {
+    return buildYYYYMMDD(exactYMD[1], exactYMD[2], exactYMD[3]);
   }
 
   const matchDMY = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
@@ -116,13 +168,13 @@ function convertirFecha(value) {
       anio = `20${anio}`;
     }
 
-    return `${anio}-${mes}-${dia}`;
+    return buildYYYYMMDD(anio, mes, dia);
   }
 
   const matchYMD = raw.match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
 
   if (matchYMD) {
-    return `${matchYMD[1]}-${matchYMD[2].padStart(2, '0')}-${matchYMD[3].padStart(2, '0')}`;
+    return buildYYYYMMDD(matchYMD[1], matchYMD[2], matchYMD[3]);
   }
 
   const matchTextDMY = raw.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})/);
@@ -136,7 +188,7 @@ function convertirFecha(value) {
       anio = `20${anio}`;
     }
 
-    return `${anio}-${mes}-${dia}`;
+    return buildYYYYMMDD(anio, mes, dia);
   }
 
   /*
@@ -151,7 +203,11 @@ function convertirFecha(value) {
   const parsed = new Date(raw);
 
   if (!Number.isNaN(parsed.getTime())) {
-    return parsed.toISOString().slice(0, 10);
+    return buildYYYYMMDD(
+      parsed.getFullYear(),
+      parsed.getMonth() + 1,
+      parsed.getDate()
+    );
   }
 
   return null;
@@ -315,7 +371,24 @@ function fechaDesdeNombreHoja(sheetName, fechaDefault = null) {
 
   if (dia < 1 || dia > 31) return null;
 
-  return `${anio}-${mes}-${String(dia).padStart(2, '0')}`;
+  return buildYYYYMMDD(anio, mes, dia);
+}
+
+function elegirFechaHoja({ sheetName, matrix, fechaDefault }) {
+  const fechaPorNombre = fechaDesdeNombreHoja(sheetName, fechaDefault);
+  const fechaEnCeldas = detectarFechaHoja(matrix);
+
+  /*
+    En reportes acumulativos, las hojas suelen llamarse 5, 6, 13, etc.
+    Si el usuario manda una fecha opcional para el mes, la hoja numérica
+    manda sobre la fecha escrita en la celda, porque algunos archivos traen
+    fechas capturadas con año incorrecto o mes/día invertidos.
+  */
+  if (/^\d{1,2}$/.test(String(sheetName || '').trim()) && fechaPorNombre) {
+    return fechaPorNombre;
+  }
+
+  return fechaEnCeldas || fechaPorNombre || convertirFecha(fechaDefault);
 }
 
 function debeIgnorarHojaPorNombre(sheetName) {
@@ -413,7 +486,11 @@ function procesarHoja({ sheetName, sheet, fechaDefault }) {
     });
   }
 
-  const fechaHoja = detectarFechaHoja(matrix) || fechaDesdeNombreHoja(sheetName, fechaDefault) || convertirFecha(fechaDefault);
+  const fechaHoja = elegirFechaHoja({
+    sheetName,
+    matrix,
+    fechaDefault
+  });
 
   for (let rowIndex = headerIndex + 1; rowIndex < matrix.length; rowIndex += 1) {
     const row = matrix[rowIndex] || [];
