@@ -490,7 +490,8 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
     const negados = negadosDailyMap.get(`${usuarioId}:${fecha}`) || {};
     const partidasDia = toNumber(row.partidas_surtidas);
     const negadosPenalizablesDia = toNumber(negados.negados_penalizables);
-    const baseEfectividadDia = partidasDia + negadosPenalizablesDia;
+    const totalSurtidoRolDia = toNumber(row.surtido_total);
+    const baseEfectividadDia = totalSurtidoRolDia;
     const efectividadDiaPct = baseEfectividadDia ? percent(partidasDia, baseEfectividadDia) : 0;
     const cumpleDia = cumpleEfectividadMinima(efectividadDiaPct);
 
@@ -508,7 +509,8 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
       fecha,
       partidas_surtidas: partidasDia,
       negados_penalizables: negadosPenalizablesDia,
-      surtido_total: toNumber(row.surtido_total),
+      surtido_total: totalSurtidoRolDia,
+      total_surtido_rol: totalSurtidoRolDia,
       efectividad_pct: efectividadDiaPct,
       cumple_efectividad: cumpleDia
     });
@@ -522,7 +524,7 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
     const cumplimientoEfectividadRatio = diasEvaluados ? diasCumplenEfectividad / diasEvaluados : 0;
     const partidas = toNumber(row.partidas_surtidas);
     const negadosPenalizables = toNumber(row.negados_penalizables);
-    const baseEfectividad = partidas + negadosPenalizables;
+    const baseEfectividad = toNumber(row.surtido_total);
     const efectividadPct = baseEfectividad ? percent(partidas, baseEfectividad) : 0;
     const jornadaSegundos = getJornadaDisponibleSegundosPorFechas(fechas, 'SUCURSAL');
     const negadosExcedenLimite = excedeLimiteNegadosPenalizables(negadosPenalizables, Math.max(row.surtido_total, baseEfectividad));
@@ -576,7 +578,7 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
         negados_capturados: toNumber(row.negados_capturados),
         surtido_total: toNumber(row.surtido_total),
         efectividad_pct: efectividadPct,
-        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}% por día`,
+        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}% por día contra el total surtido de su rol`,
         tiempo_activo_segundos: toNumber(row.tiempo_activo_segundos),
         jornada_disponible_segundos: jornadaSegundos,
         partidas_por_hora_jornada: jornadaSegundos ? round2(partidas / (jornadaSegundos / 3600)) : 0,
@@ -605,7 +607,7 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
     `
     SELECT
       DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha,
-      COALESCE(SUM(ps.partidas), 0) AS partidas_surtidores_sucursal
+      COALESCE(SUM(ps.partidas + ps.ceros + ps.no_surtido), 0) AS partidas_surtidores_sucursal
     FROM productividad_sesiones ps
     INNER JOIN surtidores s ON s.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = s.usuario_id
@@ -753,10 +755,11 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
         salidas: toNumber(row.salidas),
         tp,
         total_importe: round2(row.total_importe),
+        total_surtido_sucursales: round2(totalPartidasSucursal),
         total_partidas_surtidores_sucursal: round2(totalPartidasSucursal),
         meta_individual: round2(metaIndividual),
         cumplimiento_meta_pct: round2(productividadRatio * 100),
-        regla_meta: 'Por cada día: total de partidas surtidas por sucursales / checadores activos del día; la meta individual es la suma diaria.',
+        regla_meta: 'Por cada día: total surtido por sucursales / checadores activos del día; la meta individual es la suma diaria.',
         incidencias
       },
       desglose,
@@ -1337,7 +1340,7 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
     reglas: {
       base_comision: BASE_COMISION,
       pesos: PESOS,
-      checadores_meta: 'por día: total_partidas_surtidores_sucursales_día / checadores_activos_día; la meta individual es la suma diaria',
+      checadores_meta: 'por día: total_surtido_sucursales_día / checadores_activos_día; la meta individual es la suma diaria',
       mayoreo_partidas_netas: 'partidas_oficiales - negados_penalizables',
       usuario_mixto: 'todas las funciones del mismo usuario se fusionan en una sola comisión con tope de $2,000; si tiene encargado se fusiona con su rol operativo',
       efectividad_minima: `surtidores sucursal y mayoreo requieren más de ${EFECTIVIDAD_MINIMA_PCT}% de efectividad individual por día para ganar la parte de productividad/efectividad`,
@@ -1350,64 +1353,184 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
 });
 
 
-function getDesgloseMonto(desglose, key) {
-  return toNumber(desglose?.[key]?.monto);
-}
 
 function getBloqueosTexto(bloqueos = []) {
   if (!Array.isArray(bloqueos) || !bloqueos.length) return '';
-  return bloqueos.map((bloqueo) => bloqueo.message || bloqueo.codigo).filter(Boolean).join(' | ');
+
+  return bloqueos
+    .map((bloqueo) => bloqueo.message || bloqueo.codigo)
+    .filter(Boolean)
+    .join(' | ');
+}
+
+function isFusionada(item) {
+  return item?.tipo_comision === 'OPERATIVO_FUSIONADO';
+}
+
+function getFusionComponents(item) {
+  return Array.isArray(item?.metricas?.componentes) ? item.metricas.componentes : [];
+}
+
+function getComponentByTipo(item, tipoComision) {
+  return getFusionComponents(item).find((component) => component.tipo_comision === tipoComision) || null;
+}
+
+function getMetricValue(item, key, fallback = 0) {
+  return toNumber(item?.metricas?.[key] ?? fallback);
+}
+
+function getComponentMetric(item, tipoComision, key, fallback = 0) {
+  const component = getComponentByTipo(item, tipoComision);
+  return toNumber(component?.metricas?.[key] ?? fallback);
+}
+
+function getComponentMonto(item, tipoComision) {
+  const component = getComponentByTipo(item, tipoComision);
+  return toNumber(component?.aportacion_bono ?? 0);
+}
+
+function getDirectDesgloseMonto(item, key) {
+  return toNumber(item?.desglose?.[key]?.monto);
+}
+
+function getDesgloseMonto(item, key, tipoComision = null) {
+  if (!isFusionada(item)) return getDirectDesgloseMonto(item, key);
+
+  const component = getComponentByTipo(item, tipoComision);
+  return toNumber(component?.desglose_original?.[key]?.monto);
+}
+
+function getMontoComponente(item, tipos = []) {
+  if (!isFusionada(item)) return 0;
+
+  return getFusionComponents(item).reduce((acc, component) => {
+    return tipos.includes(component.tipo_comision)
+      ? acc + toNumber(component.aportacion_bono)
+      : acc;
+  }, 0);
+}
+
+function buildReglasExportRows() {
+  return [
+    { Tipo: 'SURTIDOR_MAYOREO', Rubro: 'Partidas netas', Peso: 800, Regla: '40% del bono. Usa partidas_netas = partidas_oficiales - negados_penalizables. El día debe superar 90% de efectividad individual para aportar a productividad.' },
+    { Tipo: 'SURTIDOR_MAYOREO', Rubro: 'Partidas/hora', Peso: 400, Regla: '20% del bono. Si viene desde reporte, se acumula por día y se divide entre 8 horas. No usa HrReg.' },
+    { Tipo: 'SURTIDOR_MAYOREO', Rubro: 'Tickets', Peso: 200, Regla: '10% del bono. Se toma del reporte oficial de mayoreo.' },
+    { Tipo: 'SURTIDOR_MAYOREO', Rubro: 'Neto', Peso: 100, Regla: '5% del bono. Se toma del reporte oficial de mayoreo.' },
+    { Tipo: 'SURTIDOR_MAYOREO', Rubro: 'Negados', Peso: 300, Regla: '15% del bono. Si hay negados penalizables excedidos, el bono completo queda en $0. El porcentaje no se muestra visualmente.' },
+    { Tipo: 'SURTIDOR_MAYOREO', Rubro: 'Asistencia', Peso: 200, Regla: '10% del bono. Cumple por defecto salvo incidencia de asistencia/inasistencia injustificada.' },
+
+    { Tipo: 'SURTIDOR_SUCURSAL', Rubro: 'Efectividad', Peso: 800, Regla: '40% del bono. Efectividad individual diaria contra el total surtido de su rol. Debe ser mayor a 90%.' },
+    { Tipo: 'SURTIDOR_SUCURSAL', Rubro: 'No surtido', Peso: 300, Regla: '15% del bono. Si tiene negados penalizables, pierde el rubro; si exceden el límite operativo, el bono completo queda en $0.' },
+    { Tipo: 'SURTIDOR_SUCURSAL', Rubro: 'Asistencia', Peso: 600, Regla: '30% del bono. Cumple por defecto salvo incidencia.' },
+    { Tipo: 'SURTIDOR_SUCURSAL', Rubro: 'Orden / limpieza', Peso: 200, Regla: '10% del bono. Cumple por defecto salvo incidencia.' },
+    { Tipo: 'SURTIDOR_SUCURSAL', Rubro: 'Puntualidad', Peso: 100, Regla: '5% del bono. Cumple por defecto salvo incidencia.' },
+
+    { Tipo: 'CHECADOR_SUCURSAL', Rubro: 'Partidas / TP', Peso: 1000, Regla: '50% del bono. La meta diaria es el total surtido por sucursales dividido equitativamente entre checadores activos del día.' },
+    { Tipo: 'CHECADOR_SUCURSAL', Rubro: 'Mal empaque', Peso: 300, Regla: '15% del bono. Cumple por defecto; si hay incidencia de mal empaque, el bono completo queda en $0.' },
+    { Tipo: 'CHECADOR_SUCURSAL', Rubro: 'Faltante / sobrante', Peso: 200, Regla: '10% del bono. Cumple por defecto salvo incidencia.' },
+    { Tipo: 'CHECADOR_SUCURSAL', Rubro: 'Asistencia', Peso: 400, Regla: '20% del bono. Cumple por defecto salvo incidencia.' },
+    { Tipo: 'CHECADOR_SUCURSAL', Rubro: 'Orden', Peso: 100, Regla: '5% del bono. Cumple por defecto salvo incidencia.' },
+
+    { Tipo: 'OPERATIVO_FUSIONADO', Rubro: 'Bono fusionado', Peso: 2000, Regla: 'No cobra doble. El bono se reparte en escala entre las funciones del mismo usuario y respeta tope único de $2,000.' },
+    { Tipo: 'ENCARGADO', Rubro: 'Mayoría de equipo combinado', Peso: 2000, Regla: 'Comisiona si más del 50% de su equipo combinado comisiona. Si el encargado tiene otro rol, se fusiona con ese rol y respeta tope único.' }
+  ];
 }
 
 function buildComisionesExportRows(comisiones = []) {
-  return comisiones.map((item) => ({
-    Usuario: item.usuario_nombre || '',
-    Código: item.usuario || '',
-    Tipo: item.tipo_comision || '',
-    Estado: item.bloqueado ? 'BLOQUEADO' : item.comisiona ? 'COMISIONA' : 'NO_COMISIONA',
-    'Monto final': toNumber(item.monto_final),
-    'Proceso bono': toNumber(item.monto_acumulado),
-    'Efectividad / Cumplimiento días %': toNumber(item.metricas?.cumplimiento_efectividad_dias_pct ?? item.metricas?.cumplimiento_meta_pct ?? 0),
-    'Partidas surtidas': toNumber(item.metricas?.partidas_surtidas ?? item.metricas?.partidas_oficiales ?? 0),
-    'Partidas netas': toNumber(item.metricas?.partidas_netas ?? 0),
-    'TP checador': toNumber(item.metricas?.tp ?? 0),
-    'Meta checador': toNumber(item.metricas?.meta_individual ?? 0),
-    'Tickets': toNumber(item.metricas?.tickets ?? 0),
-    'Neto': toNumber(item.metricas?.neto ?? 0),
-    'Negados penalizables': toNumber(item.metricas?.negados_penalizables ?? 0),
-    'Negados pendientes': toNumber(item.metricas?.negados_pendientes ?? 0),
-    'Bloqueos': getBloqueosTexto(item.bloqueos),
-    'Efectividad': getDesgloseMonto(item.desglose, 'efectividad'),
-    'No surtido': getDesgloseMonto(item.desglose, 'no_surtido'),
-    'Asistencia': getDesgloseMonto(item.desglose, 'asistencia'),
-    'Orden': getDesgloseMonto(item.desglose, 'orden'),
-    'Puntualidad': getDesgloseMonto(item.desglose, 'puntualidad'),
-    'Productividad / TP': getDesgloseMonto(item.desglose, 'productividad'),
-    'Mal empaque': getDesgloseMonto(item.desglose, 'mal_empaque'),
-    'Faltante sobrante': getDesgloseMonto(item.desglose, 'faltante_sobrante'),
-    'Partidas netas rubro': getDesgloseMonto(item.desglose, 'partidas_netas'),
-    'Partidas hora': getDesgloseMonto(item.desglose, 'partidas_hora'),
-    'Tickets rubro': getDesgloseMonto(item.desglose, 'tickets'),
-    'Neto rubro': getDesgloseMonto(item.desglose, 'neto'),
-    'Negados rubro': getDesgloseMonto(item.desglose, 'negados'),
-    'Mayoría equipo': getDesgloseMonto(item.desglose, 'mayoria_equipo')
-  }));
+  return comisiones.map((item) => {
+    const esFusionado = isFusionada(item);
+    const bloqueos = getBloqueosTexto(item.bloqueos);
+
+    return {
+      Usuario: item.usuario_nombre || '',
+      Código: item.usuario || '',
+      Tipo: item.tipo_comision || '',
+      Estado: item.bloqueado ? 'BLOQUEADO' : item.comisiona ? 'COMISIONA' : 'NO_COMISIONA',
+      'Bono máximo': BASE_COMISION,
+      'Proceso bono': toNumber(item.monto_acumulado),
+      'Monto final': toNumber(item.monto_final),
+      'Bloqueos': bloqueos,
+
+      'Aporte surtidor sucursal': esFusionado ? getComponentMonto(item, 'SURTIDOR_SUCURSAL') : item.tipo_comision === 'SURTIDOR_SUCURSAL' ? toNumber(item.monto_acumulado) : 0,
+      'Aporte checador sucursal': esFusionado ? getComponentMonto(item, 'CHECADOR_SUCURSAL') : item.tipo_comision === 'CHECADOR_SUCURSAL' ? toNumber(item.monto_acumulado) : 0,
+      'Aporte surtidor mayoreo': esFusionado ? getComponentMonto(item, 'SURTIDOR_MAYOREO') : item.tipo_comision === 'SURTIDOR_MAYOREO' ? toNumber(item.monto_acumulado) : 0,
+      'Aporte encargado': esFusionado ? getComponentMonto(item, 'ENCARGADO') : item.tipo_comision === 'ENCARGADO' ? toNumber(item.monto_acumulado) : 0,
+
+      'Sucursal partidas': esFusionado ? getComponentMetric(item, 'SURTIDOR_SUCURSAL', 'partidas_surtidas') : getMetricValue(item, 'partidas_surtidas'),
+      'Sucursal surtido total rol': esFusionado ? getComponentMetric(item, 'SURTIDOR_SUCURSAL', 'surtido_total') : getMetricValue(item, 'surtido_total'),
+      'Sucursal días cumplen': esFusionado ? getComponentMetric(item, 'SURTIDOR_SUCURSAL', 'dias_cumplen_efectividad') : getMetricValue(item, 'dias_cumplen_efectividad'),
+      'Sucursal días evaluados': esFusionado ? getComponentMetric(item, 'SURTIDOR_SUCURSAL', 'dias_evaluados') : getMetricValue(item, 'dias_evaluados'),
+
+      'Mayoreo partidas oficiales': esFusionado ? getComponentMetric(item, 'SURTIDOR_MAYOREO', 'partidas_oficiales') : getMetricValue(item, 'partidas_oficiales'),
+      'Mayoreo partidas netas': esFusionado ? getComponentMetric(item, 'SURTIDOR_MAYOREO', 'partidas_netas') : getMetricValue(item, 'partidas_netas'),
+      'Mayoreo partidas/h cálculo': esFusionado ? getComponentMetric(item, 'SURTIDOR_MAYOREO', 'partidas_netas_por_hora_calculo') : getMetricValue(item, 'partidas_netas_por_hora_calculo'),
+      'Mayoreo tickets': esFusionado ? getComponentMetric(item, 'SURTIDOR_MAYOREO', 'tickets') : getMetricValue(item, 'tickets'),
+      'Mayoreo neto': esFusionado ? getComponentMetric(item, 'SURTIDOR_MAYOREO', 'neto') : getMetricValue(item, 'neto'),
+
+      'Checador TP': esFusionado ? getComponentMetric(item, 'CHECADOR_SUCURSAL', 'tp') : getMetricValue(item, 'tp'),
+      'Checador meta': esFusionado ? getComponentMetric(item, 'CHECADOR_SUCURSAL', 'meta_individual') : getMetricValue(item, 'meta_individual'),
+      'Checador cumplimiento %': esFusionado ? getComponentMetric(item, 'CHECADOR_SUCURSAL', 'cumplimiento_meta_pct') : getMetricValue(item, 'cumplimiento_meta_pct'),
+
+      'Negados penalizables': esFusionado
+        ? getFusionComponents(item).reduce((acc, component) => acc + toNumber(component.metricas?.negados_penalizables), 0)
+        : getMetricValue(item, 'negados_penalizables'),
+      'Negados pendientes': esFusionado
+        ? getFusionComponents(item).reduce((acc, component) => acc + toNumber(component.metricas?.negados_pendientes), 0)
+        : getMetricValue(item, 'negados_pendientes')
+    };
+  });
 }
 
 function buildDesgloseExportRows(comisiones = []) {
   const rows = [];
 
   for (const item of comisiones) {
+    if (isFusionada(item)) {
+      for (const component of getFusionComponents(item)) {
+        rows.push({
+          Usuario: item.usuario_nombre || '',
+          Código: item.usuario || '',
+          Tipo: item.tipo_comision || '',
+          Componente: component.tipo_comision,
+          Rubro: 'Aporte escalado del componente',
+          Peso: toNumber(component.peso ?? item.metricas?.peso_por_rubro),
+          Valor: toNumber(component.cumplimiento_pct),
+          Monto: toNumber(component.aportacion_bono),
+          Bloqueado: component.bloqueado ? 'SI' : 'NO',
+          Nota: 'Este monto es la aportación escalada dentro del bono fusionado, no un bono adicional.'
+        });
+
+        for (const [clave, rubro] of Object.entries(component.desglose_original || {})) {
+          rows.push({
+            Usuario: item.usuario_nombre || '',
+            Código: item.usuario || '',
+            Tipo: item.tipo_comision || '',
+            Componente: component.tipo_comision,
+            Rubro: rubro.label || clave,
+            Peso: toNumber(rubro.peso),
+            Valor: toNumber(rubro.valor),
+            Monto: toNumber(rubro.monto),
+            Bloqueado: rubro.bloqueado ? 'SI' : 'NO',
+            Nota: 'Desglose original del componente antes de escalar al bono fusionado.'
+          });
+        }
+      }
+
+      continue;
+    }
+
     for (const [clave, rubro] of Object.entries(item.desglose || {})) {
       rows.push({
         Usuario: item.usuario_nombre || '',
         Código: item.usuario || '',
         Tipo: item.tipo_comision || '',
+        Componente: item.tipo_comision || '',
         Rubro: rubro.label || clave,
         Peso: toNumber(rubro.peso),
         Valor: toNumber(rubro.valor),
         Monto: toNumber(rubro.monto),
-        Bloqueado: rubro.bloqueado ? 'SI' : 'NO'
+        Bloqueado: rubro.bloqueado ? 'SI' : 'NO',
+        Nota: ''
       });
     }
   }
@@ -1415,26 +1538,44 @@ function buildDesgloseExportRows(comisiones = []) {
   return rows;
 }
 
+function pushDiasRows(rows, item, tipo, dias = []) {
+  for (const dia of dias) {
+    rows.push({
+      Usuario: item.usuario_nombre || '',
+      Código: item.usuario || '',
+      Tipo: item.tipo_comision || '',
+      Componente: tipo || item.tipo_comision || '',
+      Fecha: dia.fecha || '',
+      'Surtido total rol': toNumber(dia.total_surtido_rol ?? dia.surtido_total ?? 0),
+      'Partidas / TP': toNumber(dia.partidas_surtidas ?? dia.partidas_oficiales ?? dia.tp ?? 0),
+      'Partidas netas': toNumber(dia.partidas_netas ?? 0),
+      'Negados penalizables': toNumber(dia.negados_penalizables ?? 0),
+      'Meta día': toNumber(dia.meta_dia ?? 0),
+      'Surtido sucursales día': toNumber(dia.surtido_sucursales_dia ?? dia.partidas_surtidores_sucursal_dia ?? 0),
+      'Checadores activos día': toNumber(dia.checadores_activos_dia ?? 0),
+      'Cumple efectividad': dia.cumple_efectividad === undefined ? '' : dia.cumple_efectividad ? 'SI' : 'NO',
+      'Cumplimiento día %': toNumber(dia.cumplimiento_dia_pct ?? dia.efectividad_pct ?? 0),
+      'Tickets día': toNumber(dia.tickets ?? 0),
+      'Neto día': toNumber(dia.neto ?? 0)
+    });
+  }
+}
+
 function buildDiasExportRows(comisiones = []) {
   const rows = [];
 
   for (const item of comisiones) {
-    const dias = item.metricas?.dias_efectividad || item.metricas?.dias || [];
+    if (isFusionada(item)) {
+      for (const component of getFusionComponents(item)) {
+        const dias = component.metricas?.dias_efectividad || component.metricas?.dias || [];
+        pushDiasRows(rows, item, component.tipo_comision, dias);
+      }
 
-    for (const dia of dias) {
-      rows.push({
-        Usuario: item.usuario_nombre || '',
-        Código: item.usuario || '',
-        Tipo: item.tipo_comision || '',
-        Fecha: dia.fecha || '',
-        'Partidas / TP': toNumber(dia.partidas_surtidas ?? dia.partidas_oficiales ?? dia.tp ?? 0),
-        'Partidas netas': toNumber(dia.partidas_netas ?? 0),
-        'Negados penalizables': toNumber(dia.negados_penalizables ?? 0),
-        'Meta día': toNumber(dia.meta_dia ?? 0),
-        'Cumple efectividad': dia.cumple_efectividad === undefined ? '' : dia.cumple_efectividad ? 'SI' : 'NO',
-        'Cumplimiento día %': toNumber(dia.cumplimiento_dia_pct ?? dia.efectividad_pct ?? 0)
-      });
+      continue;
     }
+
+    const dias = item.metricas?.dias_efectividad || item.metricas?.dias || [];
+    pushDiasRows(rows, item, item.tipo_comision, dias);
   }
 
   return rows;
@@ -1458,9 +1599,11 @@ export const exportarComisionesExcel = asyncHandler(async (req, res) => {
     Registros: resumen.total_registros,
     Comisionan: resumen.comisionan,
     Bloqueados: resumen.bloqueados,
-    'Monto final': resumen.total_monto_final
+    'Monto final': resumen.total_monto_final,
+    Nota: 'El monto final ya respeta bloqueos y tope único de $2,000 por usuario.'
   }]);
 
+  appendSheet(workbook, 'Reglas', buildReglasExportRows());
   appendSheet(workbook, 'Comisiones', buildComisionesExportRows(comisiones));
   appendSheet(workbook, 'Desglose', buildDesgloseExportRows(comisiones));
   appendSheet(workbook, 'Diario', buildDiasExportRows(comisiones));
