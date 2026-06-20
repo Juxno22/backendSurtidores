@@ -732,7 +732,8 @@ export const importarReporteGrupalExcel = asyncHandler(async (req, res) => {
 
   const parseResult = parseReporteGrupalExcel(req.file.buffer, {
     fechaDefault,
-    sheetName
+    sheetName,
+    archivoNombre: req.file.originalname
   });
 
   if (parseResult.rows.length === 0) {

@@ -213,6 +213,82 @@ function convertirFecha(value) {
   return null;
 }
 
+
+const MESES_NOMBRE = {
+  ENERO: '01',
+  FEBRERO: '02',
+  MARZO: '03',
+  ABRIL: '04',
+  MAYO: '05',
+  JUNIO: '06',
+  JULIO: '07',
+  AGOSTO: '08',
+  SEPTIEMBRE: '09',
+  SETIEMBRE: '09',
+  OCTUBRE: '10',
+  NOVIEMBRE: '11',
+  DICIEMBRE: '12'
+};
+
+function inferFechaDefaultFromNombreArchivo(archivoNombre) {
+  const normalizado = normalizarTexto(archivoNombre);
+
+  if (!normalizado) return null;
+
+  const anioMatch = normalizado.match(/(20\d{2})/);
+  if (!anioMatch) return null;
+
+  const anio = anioMatch[1];
+
+  for (const [mesNombre, mesNumero] of Object.entries(MESES_NOMBRE)) {
+    if (normalizado.includes(mesNombre)) {
+      return `${anio}-${mesNumero}-01`;
+    }
+  }
+
+  const matchMesAnio = normalizado.match(/(?:^|_)(\d{1,2})_(20\d{2})(?:_|$)/);
+  if (matchMesAnio) {
+    const mes = Number(matchMesAnio[1]);
+
+    if (mes >= 1 && mes <= 12) {
+      return `${matchMesAnio[2]}-${String(mes).padStart(2, '0')}-01`;
+    }
+  }
+
+  return null;
+}
+
+function inferFechaBaseFromWorkbook(workbook) {
+  const periodos = new Map();
+
+  for (const sheetName of workbook.SheetNames || []) {
+    const rawName = String(sheetName || '').trim();
+
+    if (!/^\d{1,2}$/.test(rawName)) continue;
+
+    const matrix = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName], {
+      header: 1,
+      defval: null,
+      raw: false,
+      blankrows: false
+    });
+
+    const fecha = detectarFechaHoja(matrix);
+
+    if (!fecha) continue;
+
+    const periodo = fecha.slice(0, 7);
+    periodos.set(periodo, (periodos.get(periodo) || 0) + 1);
+  }
+
+  const ordenados = [...periodos.entries()].sort((a, b) => b[1] - a[1]);
+
+  if (!ordenados.length) return null;
+
+  return `${ordenados[0][0]}-01`;
+}
+
+
 const ALIAS_COLUMNAS = {
   fecha: [
     'FECHA'
@@ -621,13 +697,19 @@ function agruparRows(rows) {
 export function parseReporteGrupalExcel(buffer, options = {}) {
   const {
     fechaDefault = null,
-    sheetName = null
+    sheetName = null,
+    archivoNombre = null
   } = options;
 
   const workbook = xlsx.read(buffer, {
     type: 'buffer',
     cellDates: true
   });
+
+  const fechaBaseGlobal =
+    convertirFecha(fechaDefault) ||
+    inferFechaDefaultFromNombreArchivo(archivoNombre) ||
+    inferFechaBaseFromWorkbook(workbook);
 
   if (!workbook.SheetNames.length) {
     return {
@@ -666,7 +748,7 @@ export function parseReporteGrupalExcel(buffer, options = {}) {
     const resultadoHoja = procesarHoja({
       sheetName: nombreHoja,
       sheet: workbook.Sheets[nombreHoja],
-      fechaDefault
+      fechaDefault: fechaBaseGlobal
     });
 
     errores.push(...resultadoHoja.errores);

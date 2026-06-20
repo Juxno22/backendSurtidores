@@ -1,7 +1,10 @@
 import { pool } from '../config/db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { registrarAuditoria } from '../utils/auditoria.js';
-import { construirDetalleSurtidores } from '../utils/productividadDetalle.js';
+import {
+  construirDetalleSurtidores,
+  getJornadaDisponibleSegundosPorFechas
+} from '../utils/productividadDetalle.js';
 import {
   normalizeCodigo,
   parseNegadosMayoreoExcel,
@@ -53,6 +56,16 @@ function round2(value) {
 
 function uniqueSorted(values = []) {
   return [...new Set(values.filter(Boolean))].sort();
+}
+
+
+function uniqueDatesFromCsv(csv) {
+  return String(csv || '')
+    .split(',')
+    .map((item) => item.trim().slice(0, 10))
+    .filter(Boolean)
+    .filter((value, index, arr) => arr.indexOf(value) === index)
+    .sort();
 }
 
 async function buscarSurtidoresMayoreoPorCodigos(connection, codigos = []) {
@@ -112,6 +125,78 @@ function resumenCodigos(parsed, surtidorMap) {
     codigos_no_reportables: noReportables
   };
 }
+
+
+async function crearOActualizarNegadoSupervisorDesdeReporte(connection, fila, vinculo, mayoreoNegadoReporteId) {
+  const cantidadNegada = Math.max(0, Number(fila.cantidad_a_deber || 0));
+
+  if (!vinculo?.reportable || !vinculo?.surtidor_id || !vinculo?.usuario_id || cantidadNegada <= 0) {
+    return false;
+  }
+
+  await connection.query(
+    `
+    INSERT INTO productividad_sesion_negados (
+      sesion_id,
+      surtidor_id,
+      usuario_id,
+      fecha_operativa,
+      tipo_operacion,
+      codigo_producto,
+      producto,
+      razon_codigo,
+      razon_texto,
+      linea,
+      cantidad_negada,
+      comentario_surtidor,
+      origen,
+      mayoreo_negado_reporte_id,
+      estado_revision,
+      penaliza
+    )
+    VALUES (
+      NULL,
+      ?,
+      ?,
+      ?,
+      'MAYOREO',
+      ?,
+      ?,
+      'REPORTE_MAYOREO',
+      'Negado cargado desde reporte de mayoreo',
+      'REPORTE_MAYOREO',
+      ?,
+      ?,
+      'REPORTE_MAYOREO',
+      ?,
+      'PENDIENTE_REVISION',
+      0
+    )
+    ON DUPLICATE KEY UPDATE
+      surtidor_id = VALUES(surtidor_id),
+      usuario_id = VALUES(usuario_id),
+      fecha_operativa = VALUES(fecha_operativa),
+      codigo_producto = VALUES(codigo_producto),
+      producto = VALUES(producto),
+      cantidad_negada = VALUES(cantidad_negada),
+      comentario_surtidor = VALUES(comentario_surtidor),
+      updated_at = CURRENT_TIMESTAMP
+    `,
+    [
+      vinculo.surtidor_id,
+      vinculo.usuario_id,
+      fila.fecha_operativa,
+      fila.codigo_producto,
+      fila.producto || null,
+      cantidadNegada,
+      `Reporte mayoreo. A surtir: ${fila.cantidad_a_surtir || 0}; surtido: ${fila.cantidad_surtida || 0}; inventario anterior: ${fila.inventario_anterior || 0}; inventario después ticket: ${fila.inventario_despues_ticket || 0}.`,
+      mayoreoNegadoReporteId
+    ]
+  );
+
+  return true;
+}
+
 
 async function crearImportacion(connection, req, {
   archivoNombre,
@@ -406,6 +491,7 @@ export const importarNegadosMayoreo = asyncHandler(async (req, res) => {
 
     let insertados = 0;
     let actualizados = 0;
+    let enviadosSupervisor = 0;
 
     for (const fila of parsed.filas) {
       const vinculo = surtidorMap.get(normalizeCodigo(fila.codigo_surtidor_reporte));
@@ -483,6 +569,25 @@ export const importarNegadosMayoreo = asyncHandler(async (req, res) => {
 
       if (result.affectedRows === 1) insertados += 1;
       if (result.affectedRows === 2) actualizados += 1;
+
+      const [negadoReporteRows] = await connection.query(
+        `
+        SELECT id
+        FROM mayoreo_negados_reporte
+        WHERE hash_dedupe = ?
+        LIMIT 1
+        `,
+        [fila.hash_dedupe]
+      );
+
+      const enviado = await crearOActualizarNegadoSupervisorDesdeReporte(
+        connection,
+        fila,
+        vinculo,
+        negadoReporteRows[0]?.id || null
+      );
+
+      if (enviado) enviadosSupervisor += 1;
     }
 
     await connection.query(
@@ -506,6 +611,7 @@ export const importarNegadosMayoreo = asyncHandler(async (req, res) => {
         resumen: parsed.resumen,
         insertados,
         actualizados,
+        enviados_supervisor: enviadosSupervisor,
         ...codigosResumen
       }
     });
@@ -520,6 +626,7 @@ export const importarNegadosMayoreo = asyncHandler(async (req, res) => {
         ...parsed.resumen,
         insertados,
         actualizados,
+        enviados_supervisor: enviadosSupervisor,
         ...codigosResumen
       },
       hojas: parsed.hojas,
@@ -551,7 +658,8 @@ export const resumenMayoreo = asyncHandler(async (req, res) => {
       COUNT(DISTINCT mrs.ticket) AS tickets,
       COALESCE(SUM(mrs.tp), 0) AS partidas_oficiales,
       COALESCE(SUM(mrs.neto), 0) AS neto,
-      COUNT(*) AS movimientos
+      COUNT(*) AS movimientos,
+      GROUP_CONCAT(DISTINCT DATE_FORMAT(mrs.fecha, '%Y-%m-%d') ORDER BY mrs.fecha SEPARATOR ',') AS fechas_reporte
     FROM mayoreo_reportes_surtidores mrs
     INNER JOIN surtidores s ON s.id = mrs.surtidor_id
     INNER JOIN usuarios u ON u.id = mrs.usuario_id
@@ -688,7 +796,8 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
       COALESCE(SUM(mrs.tp), 0) AS partidas_oficiales,
       COALESCE(SUM(mrs.neto), 0) AS neto,
       MIN(mrs.fecha) AS fecha_min,
-      MAX(mrs.fecha) AS fecha_max
+      MAX(mrs.fecha) AS fecha_max,
+      GROUP_CONCAT(DISTINCT DATE_FORMAT(mrs.fecha, '%Y-%m-%d') ORDER BY mrs.fecha SEPARATOR ',') AS fechas_reporte
     FROM mayoreo_reportes_surtidores mrs
     INNER JOIN surtidores s ON s.id = mrs.surtidor_id
     INNER JOIN usuarios u ON u.id = mrs.usuario_id
@@ -823,6 +932,8 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
         tickets: 0,
         partidas_oficiales: 0,
         neto: 0,
+        fechas_reporte_set: new Set(),
+        jornada_reporte_segundos: 0,
 
         sesiones: 0,
         surtido_capturado: 0,
@@ -857,6 +968,7 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
     item.tickets += Number(row.tickets || 0);
     item.partidas_oficiales += Number(row.partidas_oficiales || 0);
     item.neto += Number(row.neto || 0);
+    uniqueDatesFromCsv(row.fechas_reporte).forEach((fecha) => item.fechas_reporte_set.add(fecha));
   }
 
   for (const row of detalleSesiones.ranking) {
@@ -881,23 +993,38 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
 
   const ranking = [...map.values()].map((item) => {
     const partidasNetas = Math.max(0, Number(item.partidas_oficiales || 0) - Number(item.negados_penalizables || 0));
+    const fechasReporte = [...(item.fechas_reporte_set || new Set())].sort();
+    const jornadaReporteSegundos = getJornadaDisponibleSegundosPorFechas(fechasReporte, 'MAYOREO');
     const horasActivas = Number(item.tiempo_activo_segundos || 0) / 3600;
-    const horasJornada = Number(item.jornada_disponible_segundos || 0) / 3600;
+    const horasJornadaApp = Number(item.jornada_disponible_segundos || 0) / 3600;
+    const horasReporte = jornadaReporteSegundos / 3600;
+    const modoProductividad = Number(item.tiempo_activo_segundos || 0) > 0
+      ? 'APP_TIEMPO_REAL'
+      : 'REPORTE_JORNADA';
+
+    const partidasPorHoraApp = horasActivas ? round2(partidasNetas / horasActivas) : 0;
+    const partidasPorHoraReporte = horasReporte ? round2(partidasNetas / horasReporte) : 0;
 
     return {
       ...item,
+      fechas_reporte: fechasReporte,
       neto: round2(item.neto),
       partidas_netas: partidasNetas,
+      jornada_reporte_segundos: jornadaReporteSegundos,
+      jornada_reporte_horas: round2(horasReporte),
       tiempo_activo_horas: round2(horasActivas),
       tiempo_muerto_horas: round2(Number(item.tiempo_muerto_segundos || 0) / 3600),
-      jornada_disponible_horas: round2(horasJornada),
-      partidas_netas_por_hora_activa: horasActivas ? round2(partidasNetas / horasActivas) : 0,
-      partidas_netas_por_hora_jornada: horasJornada ? round2(partidasNetas / horasJornada) : 0,
+      jornada_disponible_horas: round2(horasJornadaApp),
+      partidas_netas_por_hora_activa: partidasPorHoraApp,
+      partidas_netas_por_hora_reporte: partidasPorHoraReporte,
+      partidas_netas_por_hora_jornada: horasJornadaApp ? round2(partidasNetas / horasJornadaApp) : 0,
+      partidas_netas_por_hora_calculo: modoProductividad === 'APP_TIEMPO_REAL' ? partidasPorHoraApp : partidasPorHoraReporte,
+      modo_productividad: modoProductividad,
       productividad_conciliada: Boolean(Number(item.partidas_oficiales || 0) && Number(item.tiempo_activo_segundos || 0)),
       bloqueado_por_negados_pendientes: Number(item.negados_pendientes || 0) > 0
     };
   }).sort((a, b) => {
-    return b.partidas_netas_por_hora_activa - a.partidas_netas_por_hora_activa ||
+    return b.partidas_netas_por_hora_calculo - a.partidas_netas_por_hora_calculo ||
       b.partidas_netas - a.partidas_netas ||
       b.tickets - a.tickets;
   });
@@ -917,6 +1044,7 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
     acc.tiempo_activo_segundos += row.tiempo_activo_segundos;
     acc.tiempo_muerto_segundos += row.tiempo_muerto_segundos;
     acc.jornada_disponible_segundos += row.jornada_disponible_segundos;
+    acc.jornada_reporte_segundos += row.jornada_reporte_segundos;
     acc.negados_excel += row.negados_excel;
     acc.negados_pendientes += row.negados_pendientes;
     acc.negados_no_penalizan += row.negados_no_penalizan;
@@ -937,6 +1065,7 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
     tiempo_activo_segundos: 0,
     tiempo_muerto_segundos: 0,
     jornada_disponible_segundos: 0,
+    jornada_reporte_segundos: 0,
     negados_excel: 0,
     negados_pendientes: 0,
     negados_no_penalizan: 0,
@@ -947,11 +1076,15 @@ export const productividadMayoreo = asyncHandler(async (req, res) => {
   resumen.tiempo_activo_horas = round2(resumen.tiempo_activo_segundos / 3600);
   resumen.tiempo_muerto_horas = round2(resumen.tiempo_muerto_segundos / 3600);
   resumen.jornada_disponible_horas = round2(resumen.jornada_disponible_segundos / 3600);
+  resumen.jornada_reporte_horas = round2(resumen.jornada_reporte_segundos / 3600);
   resumen.partidas_netas_por_hora_activa = resumen.tiempo_activo_segundos
     ? round2(resumen.partidas_netas / (resumen.tiempo_activo_segundos / 3600))
     : 0;
   resumen.partidas_netas_por_hora_jornada = resumen.jornada_disponible_segundos
     ? round2(resumen.partidas_netas / (resumen.jornada_disponible_segundos / 3600))
+    : 0;
+  resumen.partidas_netas_por_hora_reporte = resumen.jornada_reporte_segundos
+    ? round2(resumen.partidas_netas / (resumen.jornada_reporte_segundos / 3600))
     : 0;
 
   res.json({

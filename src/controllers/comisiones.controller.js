@@ -247,25 +247,34 @@ function fusionarComisionesOperativas(comisionesBase = []) {
 
     const usuarioBase = items[0];
     const tipos = items.map((item) => item.tipo_comision);
-    const montoAcumulado = items.reduce((acc, item) => acc + toNumber(item.monto_acumulado), 0);
     const bloqueos = uniqueBloqueos(items.flatMap((item) => item.bloqueos || []));
     const bloqueado = bloqueos.length > 0;
-    const montoFinal = bloqueado ? 0 : Math.min(BASE_COMISION, montoAcumulado);
+    const pesoPorRubro = BASE_COMISION / items.length;
 
     const desglose = {};
+    let montoProceso = 0;
 
     for (const item of items) {
+      const montoBaseIndividual = Math.min(BASE_COMISION, toNumber(item.monto_acumulado));
+      const cumplimiento = clamp01(montoBaseIndividual / BASE_COMISION);
+      const montoEscalado = bloqueado ? 0 : round2(pesoPorRubro * cumplimiento);
+
+      montoProceso += montoEscalado;
+
       desglose[item.tipo_comision] = {
         label: item.tipo_comision,
-        peso: BASE_COMISION,
-        valor: round2(item.monto_acumulado),
-        monto: round2(item.monto_acumulado),
-        monto_final_individual: round2(item.monto_final),
+        peso: round2(pesoPorRubro),
+        valor: round2(cumplimiento * 100),
+        monto: montoEscalado,
+        cumplimiento_pct: round2(cumplimiento * 100),
         bloqueado: item.bloqueado,
         comisiona: item.comisiona,
-        desglose_original: item.desglose || {}
+        desglose_original: item.desglose || {},
+        metricas_originales: item.metricas || {}
       };
     }
+
+    const montoFinal = bloqueado ? 0 : Math.min(BASE_COMISION, montoProceso);
 
     fusionadas.push({
       usuario_id: usuarioBase.usuario_id,
@@ -275,22 +284,22 @@ function fusionarComisionesOperativas(comisionesBase = []) {
       checador_id: items.find((item) => item.checador_id)?.checador_id || null,
       tipo_comision: 'OPERATIVO_FUSIONADO',
       metricas: {
-        regla: 'Usuario con más de una función operativa; se fusiona y el tope total del periodo es $2,000.',
+        regla: 'Usuario con más de una función operativa; se fusiona en un solo bono de $2,000. Cada rubro aporta una parte proporcional en escala.',
         tipos_comision: tipos,
+        peso_por_rubro: round2(pesoPorRubro),
         componentes: items.map((item) => ({
           tipo_comision: item.tipo_comision,
-          monto_acumulado: item.monto_acumulado,
-          monto_final_individual: item.monto_final,
+          cumplimiento_pct: desglose[item.tipo_comision]?.cumplimiento_pct || 0,
+          aportacion_bono: desglose[item.tipo_comision]?.monto || 0,
           comisiona: item.comisiona,
           bloqueado: item.bloqueado,
           metricas: item.metricas || {}
         })),
-        monto_acumulado_componentes: round2(montoAcumulado),
         tope_usuario: BASE_COMISION
       },
       desglose,
       bloqueos,
-      monto_acumulado: round2(montoAcumulado),
+      monto_acumulado: round2(montoFinal),
       monto_final: round2(montoFinal),
       comisiona: !bloqueado && montoFinal > 0,
       bloqueado
@@ -589,7 +598,8 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
       COUNT(*) AS movimientos,
       COUNT(DISTINCT mrs.ticket) AS tickets,
       COALESCE(SUM(mrs.tp), 0) AS partidas_oficiales,
-      COALESCE(SUM(mrs.neto), 0) AS neto
+      COALESCE(SUM(mrs.neto), 0) AS neto,
+      GROUP_CONCAT(DISTINCT DATE_FORMAT(mrs.fecha, '%Y-%m-%d') ORDER BY mrs.fecha SEPARATOR ',') AS fechas_reporte
     FROM mayoreo_reportes_surtidores mrs
     INNER JOIN surtidores s ON s.id = mrs.surtidor_id
     INNER JOIN usuarios u ON u.id = mrs.usuario_id
@@ -648,23 +658,35 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
     const partidasNetas = Math.max(0, toNumber(row.partidas_oficiales) - toNumber(negados.negados_penalizables));
     const tiempoActivo = toNumber(sesiones.tiempo_activo_segundos);
     const horasActivas = tiempoActivo / 3600;
+    const fechasReporte = uniqueDatesFromCsv(row.fechas_reporte);
+    const jornadaReporteSegundos = getJornadaDisponibleSegundosPorFechas(fechasReporte, 'MAYOREO');
+    const horasReporte = jornadaReporteSegundos / 3600;
+    const modoProductividad = tiempoActivo > 0 ? 'APP_TIEMPO_REAL' : 'REPORTE_JORNADA';
+    const partidasHoraActiva = horasActivas ? partidasNetas / horasActivas : 0;
+    const partidasHoraReporte = horasReporte ? partidasNetas / horasReporte : 0;
 
     return {
       ...row,
       sesiones: toNumber(sesiones.sesiones),
       fechas: uniqueDatesFromCsv(sesiones.fechas),
+      fechas_reporte: fechasReporte,
+      jornada_reporte_segundos: jornadaReporteSegundos,
       tiempo_activo_segundos: tiempoActivo,
       horas_activas: horasActivas,
+      horas_reporte: horasReporte,
+      modo_productividad: modoProductividad,
       negados_pendientes: toNumber(negados.negados_pendientes),
       negados_no_penalizan: toNumber(negados.negados_no_penalizan),
       negados_penalizables: toNumber(negados.negados_penalizables),
       partidas_netas: partidasNetas,
-      partidas_netas_por_hora_activa: horasActivas ? partidasNetas / horasActivas : 0
+      partidas_netas_por_hora_activa: partidasHoraActiva,
+      partidas_netas_por_hora_reporte: partidasHoraReporte,
+      partidas_netas_por_hora_calculo: modoProductividad === 'APP_TIEMPO_REAL' ? partidasHoraActiva : partidasHoraReporte
     };
   });
 
   const maxPartidasNetas = Math.max(...baseRows.map((row) => row.partidas_netas), 0);
-  const maxPartidasHora = Math.max(...baseRows.map((row) => row.partidas_netas_por_hora_activa), 0);
+  const maxPartidasHora = Math.max(...baseRows.map((row) => row.partidas_netas_por_hora_calculo), 0);
   const maxTickets = Math.max(...baseRows.map((row) => toNumber(row.tickets)), 0);
   const maxNeto = Math.max(...baseRows.map((row) => toNumber(row.neto)), 0);
 
@@ -679,10 +701,10 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
         monto: maxPartidasNetas ? round2(PESOS.SURTIDOR_MAYOREO.partidas_netas * clamp01(row.partidas_netas / maxPartidasNetas)) : 0
       },
       partidas_hora: {
-        label: 'Partidas netas / hora activa',
+        label: row.modo_productividad === 'APP_TIEMPO_REAL' ? 'Partidas netas / hora activa' : 'Partidas netas / jornada reporte',
         peso: PESOS.SURTIDOR_MAYOREO.partidas_hora,
-        valor: round2(row.partidas_netas_por_hora_activa),
-        monto: maxPartidasHora ? round2(PESOS.SURTIDOR_MAYOREO.partidas_hora * clamp01(row.partidas_netas_por_hora_activa / maxPartidasHora)) : 0
+        valor: round2(row.partidas_netas_por_hora_calculo),
+        monto: maxPartidasHora ? round2(PESOS.SURTIDOR_MAYOREO.partidas_hora * clamp01(row.partidas_netas_por_hora_calculo / maxPartidasHora)) : 0
       },
       tickets: {
         label: 'Tickets',
@@ -725,10 +747,14 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
         neto: round2(row.neto),
         sesiones: row.sesiones,
         tiempo_activo_segundos: row.tiempo_activo_segundos,
+        jornada_reporte_segundos: row.jornada_reporte_segundos,
+        modo_productividad: row.modo_productividad,
         partidas_netas_por_hora_activa: round2(row.partidas_netas_por_hora_activa),
+        partidas_netas_por_hora_reporte: round2(row.partidas_netas_por_hora_reporte),
+        partidas_netas_por_hora_calculo: round2(row.partidas_netas_por_hora_calculo),
         referencias_equipo: {
           max_partidas_netas: maxPartidasNetas,
-          max_partidas_hora: round2(maxPartidasHora),
+          max_partidas_hora_calculo: round2(maxPartidasHora),
           max_tickets: maxTickets,
           max_neto: round2(maxNeto)
         },

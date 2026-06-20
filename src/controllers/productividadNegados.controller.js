@@ -169,6 +169,8 @@ export const listarNegados = asyncHandler(async (req, res) => {
     SELECT
       n.id,
       n.sesion_id,
+      n.origen,
+      n.mayoreo_negado_reporte_id,
       n.surtidor_id,
       n.usuario_id,
       u.nombre AS surtidor_nombre,
@@ -179,9 +181,10 @@ export const listarNegados = asyncHandler(async (req, res) => {
       DATE_FORMAT(n.fecha_operativa, '%Y-%m-%d') AS fecha_operativa,
       n.tipo_operacion,
       ps.sucursal_id,
-      sc.nombre AS sucursal_nombre,
+      COALESCE(sc.nombre, CASE WHEN n.tipo_operacion = 'MAYOREO' THEN 'Mayoreo' ELSE NULL END) AS sucursal_nombre,
 
       n.codigo_producto,
+      n.producto,
       n.razon_codigo,
       n.razon_texto,
       n.linea,
@@ -200,7 +203,7 @@ export const listarNegados = asyncHandler(async (req, res) => {
       DATE_FORMAT(n.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
       DATE_FORMAT(n.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
     FROM productividad_sesion_negados n
-    INNER JOIN productividad_sesiones ps ON ps.id = n.sesion_id
+    LEFT JOIN productividad_sesiones ps ON ps.id = n.sesion_id
     INNER JOIN surtidores su ON su.id = n.surtidor_id
     INNER JOIN usuarios u ON u.id = n.usuario_id
     LEFT JOIN sucursales sc ON sc.id = ps.sucursal_id
@@ -219,7 +222,7 @@ export const listarNegados = asyncHandler(async (req, res) => {
       COUNT(*) AS registros,
       COALESCE(SUM(n.cantidad_negada), 0) AS cantidad
     FROM productividad_sesion_negados n
-    INNER JOIN productividad_sesiones ps ON ps.id = n.sesion_id
+    LEFT JOIN productividad_sesiones ps ON ps.id = n.sesion_id
     INNER JOIN surtidores su ON su.id = n.surtidor_id
     INNER JOIN usuarios u ON u.id = n.usuario_id
     WHERE ${whereSql}
