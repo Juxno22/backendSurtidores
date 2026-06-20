@@ -776,7 +776,7 @@ async function guardarCalculo(connection, req, { desde, hasta, motivo, resumen, 
   }
 
   await connection.query(
-    'DELETE FROM comisiones_individuales WHERE periodo_id = ? AND estado = 'BORRADOR'',
+  `DELETE FROM comisiones_individuales WHERE periodo_id = ? AND estado = 'BORRADOR'`,
     [periodoId]
   );
 
