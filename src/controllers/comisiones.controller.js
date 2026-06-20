@@ -3,6 +3,7 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 import { registrarAuditoria } from '../utils/auditoria.js';
 import { getNowMexicoDateTime } from '../utils/mexicoTime.js';
 import { getJornadaDisponibleSegundosPorFechas } from '../utils/productividadDetalle.js';
+import XLSX from 'xlsx';
 
 const BASE_COMISION = 2000;
 const EFECTIVIDAD_MINIMA_PCT = 90;
@@ -104,6 +105,39 @@ function uniqueDatesFromCsv(csv) {
     .split(',')
     .map((item) => item.trim().slice(0, 10))
     .filter(Boolean);
+}
+
+
+function addDays(fecha, days = 1) {
+  const date = new Date(`${fecha}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function dateRange(desde, hasta) {
+  const dates = [];
+  let current = desde;
+  let safety = 0;
+
+  while (current <= hasta && safety < 370) {
+    dates.push(current);
+    current = addDays(current, 1);
+    safety += 1;
+  }
+
+  return dates;
+}
+
+function mapBy(rows = [], keyBuilder) {
+  const map = new Map();
+  for (const row of rows) {
+    map.set(keyBuilder(row), row);
+  }
+  return map;
+}
+
+function montoPorCumplimiento(peso, cumplimientoRatio) {
+  return round2(toNumber(peso) * clamp01(cumplimientoRatio));
 }
 
 function normalizeEnum(value) {
@@ -372,7 +406,7 @@ async function getIncidenciasActivas(desde, hasta) {
 }
 
 async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
-  const [rows] = await pool.query(
+  const [dailyRows] = await pool.query(
     `
     SELECT
       u.id AS usuario_id,
@@ -381,13 +415,13 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
       s.id AS surtidor_id,
       s.codigo AS surtidor_codigo,
       s.codigo_reporte,
+      DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha,
       COUNT(*) AS sesiones,
       COALESCE(SUM(ps.partidas), 0) AS partidas_surtidas,
       COALESCE(SUM(ps.ceros), 0) AS ceros,
       COALESCE(SUM(ps.no_surtido), 0) AS negados_capturados,
       COALESCE(SUM(ps.partidas + ps.ceros + ps.no_surtido), 0) AS surtido_total,
-      COALESCE(SUM(ps.duracion_laboral_segundos), 0) AS tiempo_activo_segundos,
-      GROUP_CONCAT(DISTINCT DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') ORDER BY ps.fecha_operativa SEPARATOR ',') AS fechas
+      COALESCE(SUM(ps.duracion_laboral_segundos), 0) AS tiempo_activo_segundos
     FROM productividad_sesiones ps
     INNER JOIN surtidores s ON s.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = s.usuario_id
@@ -397,48 +431,108 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
       AND s.tipo_operacion = 'SUCURSAL'
       AND s.activo = 1
       AND u.activo = 1
-    GROUP BY u.id, u.nombre, u.usuario, s.id, s.codigo, s.codigo_reporte
+    GROUP BY u.id, u.nombre, u.usuario, s.id, s.codigo, s.codigo_reporte, ps.fecha_operativa
+    ORDER BY u.nombre ASC, ps.fecha_operativa ASC
     `,
     [desde, hasta]
   );
 
-  const [negadosRows] = await pool.query(
+  const [negadosDailyRows] = await pool.query(
     `
     SELECT
       usuario_id,
+      DATE_FORMAT(fecha_operativa, '%Y-%m-%d') AS fecha,
       COALESCE(SUM(CASE WHEN estado_revision = 'PENDIENTE_REVISION' THEN cantidad_negada ELSE 0 END), 0) AS negados_pendientes,
       COALESCE(SUM(CASE WHEN estado_revision = 'RECHAZADO_PENALIZA' THEN cantidad_negada ELSE 0 END), 0) AS negados_penalizables,
       COALESCE(SUM(CASE WHEN estado_revision = 'VALIDADO_NO_PENALIZA' THEN cantidad_negada ELSE 0 END), 0) AS negados_no_penalizan
     FROM productividad_sesion_negados
     WHERE tipo_operacion = 'SUCURSAL'
       AND fecha_operativa BETWEEN ? AND ?
-    GROUP BY usuario_id
+    GROUP BY usuario_id, fecha_operativa
     `,
     [desde, hasta]
   );
 
-  const negadosMap = new Map(negadosRows.map((row) => [Number(row.usuario_id), row]));
+  const negadosDailyMap = mapBy(
+    negadosDailyRows,
+    (row) => `${Number(row.usuario_id)}:${row.fecha}`
+  );
 
-  return rows.map((row) => {
-    const negados = negadosMap.get(Number(row.usuario_id)) || {};
+  const byUser = new Map();
+
+  for (const row of dailyRows) {
+    const usuarioId = Number(row.usuario_id);
+
+    if (!byUser.has(usuarioId)) {
+      byUser.set(usuarioId, {
+        usuario_id: usuarioId,
+        usuario_nombre: row.usuario_nombre,
+        usuario: row.usuario,
+        surtidor_id: row.surtidor_id,
+        surtidor_codigo: row.surtidor_codigo,
+        codigo_reporte: row.codigo_reporte,
+        sesiones: 0,
+        partidas_surtidas: 0,
+        ceros: 0,
+        negados_capturados: 0,
+        surtido_total: 0,
+        tiempo_activo_segundos: 0,
+        negados_pendientes: 0,
+        negados_penalizables: 0,
+        negados_no_penalizan: 0,
+        fechas: [],
+        dias: []
+      });
+    }
+
+    const item = byUser.get(usuarioId);
+    const fecha = row.fecha;
+    const negados = negadosDailyMap.get(`${usuarioId}:${fecha}`) || {};
+    const partidasDia = toNumber(row.partidas_surtidas);
+    const negadosPenalizablesDia = toNumber(negados.negados_penalizables);
+    const baseEfectividadDia = partidasDia + negadosPenalizablesDia;
+    const efectividadDiaPct = baseEfectividadDia ? percent(partidasDia, baseEfectividadDia) : 0;
+    const cumpleDia = cumpleEfectividadMinima(efectividadDiaPct);
+
+    item.sesiones += toNumber(row.sesiones);
+    item.partidas_surtidas += partidasDia;
+    item.ceros += toNumber(row.ceros);
+    item.negados_capturados += toNumber(row.negados_capturados);
+    item.surtido_total += toNumber(row.surtido_total);
+    item.tiempo_activo_segundos += toNumber(row.tiempo_activo_segundos);
+    item.negados_pendientes += toNumber(negados.negados_pendientes);
+    item.negados_penalizables += negadosPenalizablesDia;
+    item.negados_no_penalizan += toNumber(negados.negados_no_penalizan);
+    item.fechas.push(fecha);
+    item.dias.push({
+      fecha,
+      partidas_surtidas: partidasDia,
+      negados_penalizables: negadosPenalizablesDia,
+      surtido_total: toNumber(row.surtido_total),
+      efectividad_pct: efectividadDiaPct,
+      cumple_efectividad: cumpleDia
+    });
+  }
+
+  return [...byUser.values()].map((row) => {
     const incidencias = getIncidenciasFor(incidenciasMap, row.usuario_id, 'SURTIDOR_SUCURSAL');
-    const surtidoTotal = toNumber(row.surtido_total);
+    const fechas = [...new Set(row.fechas)];
+    const diasEvaluados = row.dias.length;
+    const diasCumplenEfectividad = row.dias.filter((dia) => dia.cumple_efectividad).length;
+    const cumplimientoEfectividadRatio = diasEvaluados ? diasCumplenEfectividad / diasEvaluados : 0;
     const partidas = toNumber(row.partidas_surtidas);
-    const negadosPenalizables = toNumber(negados.negados_penalizables);
+    const negadosPenalizables = toNumber(row.negados_penalizables);
     const baseEfectividad = partidas + negadosPenalizables;
     const efectividadPct = baseEfectividad ? percent(partidas, baseEfectividad) : 0;
-    const cumpleEfectividad = cumpleEfectividadMinima(efectividadPct);
-    const surtidoBaseNegados = Math.max(surtidoTotal, baseEfectividad);
-    const negadosExcedenLimite = excedeLimiteNegadosPenalizables(negadosPenalizables, surtidoBaseNegados);
-    const fechas = uniqueDatesFromCsv(row.fechas);
     const jornadaSegundos = getJornadaDisponibleSegundosPorFechas(fechas, 'SUCURSAL');
+    const negadosExcedenLimite = excedeLimiteNegadosPenalizables(negadosPenalizables, Math.max(row.surtido_total, baseEfectividad));
 
     const desglose = {
       efectividad: {
-        label: 'Efectividad individual > 90%',
+        label: 'Efectividad individual diaria > 90%',
         peso: PESOS.SURTIDOR_SUCURSAL.efectividad,
-        valor: efectividadPct,
-        monto: cumpleEfectividad ? PESOS.SURTIDOR_SUCURSAL.efectividad : 0
+        valor: round2(cumplimientoEfectividadRatio * 100),
+        monto: montoPorCumplimiento(PESOS.SURTIDOR_SUCURSAL.efectividad, cumplimientoEfectividadRatio)
       },
       no_surtido: {
         label: 'No surtido / negados penalizables',
@@ -473,25 +567,28 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
       metricas: {
         sesiones: toNumber(row.sesiones),
         fechas,
+        dias_efectividad: row.dias,
+        dias_evaluados: diasEvaluados,
+        dias_cumplen_efectividad: diasCumplenEfectividad,
+        cumplimiento_efectividad_dias_pct: round2(cumplimientoEfectividadRatio * 100),
         partidas_surtidas: partidas,
         ceros: toNumber(row.ceros),
         negados_capturados: toNumber(row.negados_capturados),
-        surtido_total: surtidoTotal,
+        surtido_total: toNumber(row.surtido_total),
         efectividad_pct: efectividadPct,
-        cumple_efectividad_minima: cumpleEfectividad,
-        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}%`,
+        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}% por día`,
         tiempo_activo_segundos: toNumber(row.tiempo_activo_segundos),
         jornada_disponible_segundos: jornadaSegundos,
         partidas_por_hora_jornada: jornadaSegundos ? round2(partidas / (jornadaSegundos / 3600)) : 0,
-        negados_pendientes: toNumber(negados.negados_pendientes),
+        negados_pendientes: toNumber(row.negados_pendientes),
         negados_penalizables: negadosPenalizables,
-        negados_no_penalizan: toNumber(negados.negados_no_penalizan),
+        negados_no_penalizan: toNumber(row.negados_no_penalizan),
         negados_limite_excedido: negadosExcedenLimite,
         incidencias
       },
       desglose,
       bloqueos: buildBloqueos({
-        negadosPendientes: negados.negados_pendientes,
+        negadosPendientes: row.negados_pendientes,
         incidencias,
         extra: negadosExcedenLimite ? [{
           codigo: 'NEGADOS_LIMITE_EXCEDIDO',
@@ -504,9 +601,11 @@ async function calcularSurtidoresSucursal(desde, hasta, incidenciasMap) {
 }
 
 async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
-  const [partidasRows] = await pool.query(
+  const [partidasDiaRows] = await pool.query(
     `
-    SELECT COALESCE(SUM(ps.partidas), 0) AS partidas_surtidores_sucursal
+    SELECT
+      DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha,
+      COALESCE(SUM(ps.partidas), 0) AS partidas_surtidores_sucursal
     FROM productividad_sesiones ps
     INNER JOIN surtidores s ON s.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = s.usuario_id
@@ -515,13 +614,16 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
       AND ps.fecha_operativa BETWEEN ? AND ?
       AND s.activo = 1
       AND u.activo = 1
+    GROUP BY ps.fecha_operativa
     `,
     [desde, hasta]
   );
 
-  const totalPartidasSucursal = toNumber(partidasRows[0]?.partidas_surtidores_sucursal);
+  const partidasDiaMap = new Map(
+    partidasDiaRows.map((row) => [row.fecha, toNumber(row.partidas_surtidores_sucursal)])
+  );
 
-  const [rows] = await pool.query(
+  const [dailyRows] = await pool.query(
     `
     SELECT
       u.id AS usuario_id,
@@ -529,10 +631,10 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
       u.usuario,
       c.id AS checador_id,
       c.codigo_reporte,
+      DATE_FORMAT(cr.fecha, '%Y-%m-%d') AS fecha,
       COUNT(*) AS salidas,
       COALESCE(SUM(cr.tp), 0) AS tp,
-      COALESCE(SUM(cr.total), 0) AS total_importe,
-      GROUP_CONCAT(DISTINCT DATE_FORMAT(cr.fecha, '%Y-%m-%d') ORDER BY cr.fecha SEPARATOR ',') AS fechas
+      COALESCE(SUM(cr.total), 0) AS total_importe
     FROM checadores_reportes cr
     INNER JOIN checadores c ON c.id = cr.checador_id
     INNER JOIN usuarios u ON u.id = c.usuario_id
@@ -540,24 +642,69 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
       AND c.usuario_id IS NOT NULL
       AND c.activo = 1
       AND u.activo = 1
-    GROUP BY u.id, u.nombre, u.usuario, c.id, c.codigo_reporte
+    GROUP BY u.id, u.nombre, u.usuario, c.id, c.codigo_reporte, cr.fecha
+    ORDER BY u.nombre ASC, cr.fecha ASC
     `,
     [desde, hasta]
   );
 
-  const horasEquipo = rows.reduce((acc, row) => {
-    const fechas = uniqueDatesFromCsv(row.fechas);
-    return acc + (getJornadaDisponibleSegundosPorFechas(fechas, 'SUCURSAL') / 3600);
-  }, 0);
+  const checadoresPorDia = new Map();
 
-  const metaTpPorHora = horasEquipo ? totalPartidasSucursal / horasEquipo : 0;
+  for (const row of dailyRows) {
+    const fecha = row.fecha;
+    if (!checadoresPorDia.has(fecha)) checadoresPorDia.set(fecha, new Set());
+    checadoresPorDia.get(fecha).add(Number(row.checador_id));
+  }
 
-  return rows.map((row) => {
-    const fechas = uniqueDatesFromCsv(row.fechas);
-    const jornadaSegundos = getJornadaDisponibleSegundosPorFechas(fechas, 'SUCURSAL');
-    const horas = jornadaSegundos / 3600;
-    const metaIndividual = horas * metaTpPorHora;
+  const byUser = new Map();
+
+  for (const row of dailyRows) {
+    const usuarioId = Number(row.usuario_id);
+    const fecha = row.fecha;
+    const checadoresActivosDia = checadoresPorDia.get(fecha)?.size || 0;
+    const partidasSucursalDia = partidasDiaMap.get(fecha) || 0;
+    const metaDia = checadoresActivosDia ? partidasSucursalDia / checadoresActivosDia : 0;
+
+    if (!byUser.has(usuarioId)) {
+      byUser.set(usuarioId, {
+        usuario_id: usuarioId,
+        usuario_nombre: row.usuario_nombre,
+        usuario: row.usuario,
+        checador_id: row.checador_id,
+        codigo_reporte: row.codigo_reporte,
+        salidas: 0,
+        tp: 0,
+        total_importe: 0,
+        meta_individual: 0,
+        fechas: [],
+        dias: []
+      });
+    }
+
+    const item = byUser.get(usuarioId);
+
+    item.salidas += toNumber(row.salidas);
+    item.tp += toNumber(row.tp);
+    item.total_importe += toNumber(row.total_importe);
+    item.meta_individual += metaDia;
+    item.fechas.push(fecha);
+    item.dias.push({
+      fecha,
+      tp: toNumber(row.tp),
+      salidas: toNumber(row.salidas),
+      partidas_surtidores_sucursal_dia: round2(partidasSucursalDia),
+      checadores_activos_dia: checadoresActivosDia,
+      meta_dia: round2(metaDia),
+      cumplimiento_dia_pct: metaDia ? percent(row.tp, metaDia) : 0
+    });
+  }
+
+  const totalPartidasSucursal = [...partidasDiaMap.values()].reduce((acc, value) => acc + value, 0);
+
+  return [...byUser.values()].map((row) => {
+    const fechas = [...new Set(row.fechas)];
     const tp = toNumber(row.tp);
+    const metaIndividual = toNumber(row.meta_individual);
     const productividadRatio = metaIndividual ? clamp01(tp / metaIndividual) : 0;
     const incidencias = getIncidenciasFor(incidenciasMap, row.usuario_id, 'CHECADOR_SUCURSAL');
     const tieneMalEmpaque = hasIncidencia(incidencias, 'MAL_EMPAQUE');
@@ -565,7 +712,7 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
 
     const desglose = {
       productividad: {
-        label: 'TP contra meta automática',
+        label: 'TP contra meta diaria equitativa',
         peso: PESOS.CHECADOR_SUCURSAL.productividad,
         valor: round2(productividadRatio * 100),
         monto: round2(PESOS.CHECADOR_SUCURSAL.productividad * productividadRatio)
@@ -602,16 +749,14 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
       tipoComision: 'CHECADOR_SUCURSAL',
       metricas: {
         fechas,
+        dias: row.dias,
         salidas: toNumber(row.salidas),
         tp,
         total_importe: round2(row.total_importe),
-        jornada_disponible_segundos: jornadaSegundos,
-        horas_jornada: round2(horas),
-        total_partidas_surtidores_sucursal: totalPartidasSucursal,
-        horas_equipo_checadores: round2(horasEquipo),
-        meta_tp_por_hora: round2(metaTpPorHora),
+        total_partidas_surtidores_sucursal: round2(totalPartidasSucursal),
         meta_individual: round2(metaIndividual),
         cumplimiento_meta_pct: round2(productividadRatio * 100),
+        regla_meta: 'Por cada día: total de partidas surtidas por sucursales / checadores activos del día; la meta individual es la suma diaria.',
         incidencias
       },
       desglose,
@@ -621,7 +766,7 @@ async function calcularChecadoresSucursal(desde, hasta, incidenciasMap) {
 }
 
 async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
-  const [produccionRows] = await pool.query(
+  const [dailyRows] = await pool.query(
     `
     SELECT
       u.id AS usuario_id,
@@ -630,11 +775,11 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
       s.id AS surtidor_id,
       s.codigo AS surtidor_codigo,
       s.codigo_reporte,
+      DATE_FORMAT(mrs.fecha, '%Y-%m-%d') AS fecha,
       COUNT(*) AS movimientos,
       COUNT(DISTINCT mrs.ticket) AS tickets,
       COALESCE(SUM(mrs.tp), 0) AS partidas_oficiales,
-      COALESCE(SUM(mrs.neto), 0) AS neto,
-      GROUP_CONCAT(DISTINCT DATE_FORMAT(mrs.fecha, '%Y-%m-%d') ORDER BY mrs.fecha SEPARATOR ',') AS fechas_reporte
+      COALESCE(SUM(mrs.neto), 0) AS neto
     FROM mayoreo_reportes_surtidores mrs
     INNER JOIN surtidores s ON s.id = mrs.surtidor_id
     INNER JOIN usuarios u ON u.id = mrs.usuario_id
@@ -643,7 +788,8 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
       AND s.tipo_operacion = 'MAYOREO'
       AND s.activo = 1
       AND u.activo = 1
-    GROUP BY u.id, u.nombre, u.usuario, s.id, s.codigo, s.codigo_reporte
+    GROUP BY u.id, u.nombre, u.usuario, s.id, s.codigo, s.codigo_reporte, mrs.fecha
+    ORDER BY u.nombre ASC, mrs.fecha ASC
     `,
     [desde, hasta]
   );
@@ -669,59 +815,117 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
     [desde, hasta]
   );
 
-  const [negadosRows] = await pool.query(
+  const [negadosDailyRows] = await pool.query(
     `
     SELECT
       usuario_id,
+      DATE_FORMAT(fecha_operativa, '%Y-%m-%d') AS fecha,
       COALESCE(SUM(CASE WHEN estado_revision = 'PENDIENTE_REVISION' THEN cantidad_negada ELSE 0 END), 0) AS negados_pendientes,
       COALESCE(SUM(CASE WHEN estado_revision = 'VALIDADO_NO_PENALIZA' THEN cantidad_negada ELSE 0 END), 0) AS negados_no_penalizan,
       COALESCE(SUM(CASE WHEN estado_revision = 'RECHAZADO_PENALIZA' THEN cantidad_negada ELSE 0 END), 0) AS negados_penalizables
     FROM productividad_sesion_negados
     WHERE tipo_operacion = 'MAYOREO'
       AND fecha_operativa BETWEEN ? AND ?
-    GROUP BY usuario_id
+    GROUP BY usuario_id, fecha_operativa
     `,
     [desde, hasta]
   );
 
   const sesionesMap = new Map(sesionesRows.map((row) => [Number(row.usuario_id), row]));
-  const negadosMap = new Map(negadosRows.map((row) => [Number(row.usuario_id), row]));
+  const negadosDailyMap = mapBy(
+    negadosDailyRows,
+    (row) => `${Number(row.usuario_id)}:${row.fecha}`
+  );
 
-  const baseRows = produccionRows.map((row) => {
-    const sesiones = sesionesMap.get(Number(row.usuario_id)) || {};
-    const negados = negadosMap.get(Number(row.usuario_id)) || {};
-    const partidasOficiales = toNumber(row.partidas_oficiales);
-    const negadosPenalizables = toNumber(negados.negados_penalizables);
-    const partidasNetas = Math.max(0, partidasOficiales - negadosPenalizables);
-    const efectividadPct = partidasOficiales ? percent(partidasNetas, partidasOficiales) : 0;
-    const cumpleEfectividad = cumpleEfectividadMinima(efectividadPct);
-    const negadosExcedenLimite = excedeLimiteNegadosPenalizables(negadosPenalizables, partidasOficiales);
-    const tiempoActivo = toNumber(sesiones.tiempo_activo_segundos);
+  const byUser = new Map();
+
+  for (const row of dailyRows) {
+    const usuarioId = Number(row.usuario_id);
+    const fecha = row.fecha;
+    const negados = negadosDailyMap.get(`${usuarioId}:${fecha}`) || {};
+    const partidasOficialesDia = toNumber(row.partidas_oficiales);
+    const negadosPenalizablesDia = toNumber(negados.negados_penalizables);
+    const partidasNetasDia = Math.max(0, partidasOficialesDia - negadosPenalizablesDia);
+    const efectividadDiaPct = partidasOficialesDia ? percent(partidasNetasDia, partidasOficialesDia) : 0;
+    const cumpleDia = cumpleEfectividadMinima(efectividadDiaPct);
+
+    if (!byUser.has(usuarioId)) {
+      const sesiones = sesionesMap.get(usuarioId) || {};
+
+      byUser.set(usuarioId, {
+        usuario_id: usuarioId,
+        usuario_nombre: row.usuario_nombre,
+        usuario: row.usuario,
+        surtidor_id: row.surtidor_id,
+        surtidor_codigo: row.surtidor_codigo,
+        codigo_reporte: row.codigo_reporte,
+        movimientos: 0,
+        tickets: 0,
+        partidas_oficiales: 0,
+        partidas_netas: 0,
+        neto: 0,
+        negados_pendientes: 0,
+        negados_no_penalizan: 0,
+        negados_penalizables: 0,
+        sesiones: toNumber(sesiones.sesiones),
+        fechas_app: uniqueDatesFromCsv(sesiones.fechas),
+        tiempo_activo_segundos: toNumber(sesiones.tiempo_activo_segundos),
+        fechas_reporte: [],
+        dias: []
+      });
+    }
+
+    const item = byUser.get(usuarioId);
+
+    item.movimientos += toNumber(row.movimientos);
+    item.tickets += toNumber(row.tickets);
+    item.partidas_oficiales += partidasOficialesDia;
+    item.partidas_netas += partidasNetasDia;
+    item.neto += toNumber(row.neto);
+    item.negados_pendientes += toNumber(negados.negados_pendientes);
+    item.negados_no_penalizan += toNumber(negados.negados_no_penalizan);
+    item.negados_penalizables += negadosPenalizablesDia;
+    item.fechas_reporte.push(fecha);
+    item.dias.push({
+      fecha,
+      movimientos: toNumber(row.movimientos),
+      tickets: toNumber(row.tickets),
+      partidas_oficiales: partidasOficialesDia,
+      partidas_netas: partidasNetasDia,
+      negados_penalizables: negadosPenalizablesDia,
+      neto: round2(row.neto),
+      efectividad_pct: efectividadDiaPct,
+      cumple_efectividad: cumpleDia
+    });
+  }
+
+  const baseRows = [...byUser.values()].map((row) => {
+    const fechasReporte = [...new Set(row.fechas_reporte)];
+    const tiempoActivo = toNumber(row.tiempo_activo_segundos);
     const horasActivas = tiempoActivo / 3600;
-    const fechasReporte = uniqueDatesFromCsv(row.fechas_reporte);
     const jornadaReporteSegundos = fechasReporte.length * SEGUNDOS_JORNADA_COMPLETA;
     const horasReporte = jornadaReporteSegundos / 3600;
     const modoProductividad = tiempoActivo > 0 ? 'APP_TIEMPO_REAL' : 'REPORTE_JORNADA';
-    const partidasHoraActiva = horasActivas ? partidasNetas / horasActivas : 0;
-    const partidasHoraReporte = horasReporte ? partidasNetas / horasReporte : 0;
+    const partidasHoraActiva = horasActivas ? row.partidas_netas / horasActivas : 0;
+    const partidasHoraReporte = horasReporte ? row.partidas_netas / horasReporte : 0;
+    const diasEvaluados = row.dias.length;
+    const diasCumplenEfectividad = row.dias.filter((dia) => dia.cumple_efectividad).length;
+    const cumplimientoEfectividadRatio = diasEvaluados ? diasCumplenEfectividad / diasEvaluados : 0;
+    const efectividadPct = row.partidas_oficiales ? percent(row.partidas_netas, row.partidas_oficiales) : 0;
 
     return {
       ...row,
-      sesiones: toNumber(sesiones.sesiones),
-      fechas: uniqueDatesFromCsv(sesiones.fechas),
       fechas_reporte: fechasReporte,
       jornada_reporte_segundos: jornadaReporteSegundos,
-      tiempo_activo_segundos: tiempoActivo,
       horas_activas: horasActivas,
       horas_reporte: horasReporte,
       modo_productividad: modoProductividad,
-      negados_pendientes: toNumber(negados.negados_pendientes),
-      negados_no_penalizan: toNumber(negados.negados_no_penalizan),
-      negados_penalizables: negadosPenalizables,
-      partidas_netas: partidasNetas,
       efectividad_pct: efectividadPct,
-      cumple_efectividad_minima: cumpleEfectividad,
-      negados_limite_excedido: negadosExcedenLimite,
+      dias_evaluados: diasEvaluados,
+      dias_cumplen_efectividad: diasCumplenEfectividad,
+      cumplimiento_efectividad_ratio: cumplimientoEfectividadRatio,
+      cumplimiento_efectividad_dias_pct: round2(cumplimientoEfectividadRatio * 100),
+      negados_limite_excedido: excedeLimiteNegadosPenalizables(row.negados_penalizables, row.partidas_oficiales),
       partidas_netas_por_hora_activa: partidasHoraActiva,
       partidas_netas_por_hora_reporte: partidasHoraReporte,
       partidas_netas_por_hora_calculo: modoProductividad === 'APP_TIEMPO_REAL' ? partidasHoraActiva : partidasHoraReporte
@@ -735,31 +939,32 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
 
   return baseRows.map((row) => {
     const incidencias = getIncidenciasFor(incidenciasMap, row.usuario_id, 'SURTIDOR_MAYOREO');
+    const efectividadRatio = clamp01(row.cumplimiento_efectividad_ratio);
 
     const desglose = {
       partidas_netas: {
-        label: 'Partidas netas',
+        label: 'Partidas netas con efectividad diaria > 90%',
         peso: PESOS.SURTIDOR_MAYOREO.partidas_netas,
         valor: row.partidas_netas,
-        monto: row.cumple_efectividad_minima && maxPartidasNetas ? round2(PESOS.SURTIDOR_MAYOREO.partidas_netas * clamp01(row.partidas_netas / maxPartidasNetas)) : 0
+        monto: maxPartidasNetas ? round2(PESOS.SURTIDOR_MAYOREO.partidas_netas * clamp01(row.partidas_netas / maxPartidasNetas) * efectividadRatio) : 0
       },
       partidas_hora: {
         label: row.modo_productividad === 'APP_TIEMPO_REAL' ? 'Partidas netas / hora activa' : 'Partidas netas / jornada reporte',
         peso: PESOS.SURTIDOR_MAYOREO.partidas_hora,
         valor: round2(row.partidas_netas_por_hora_calculo),
-        monto: row.cumple_efectividad_minima && maxPartidasHora ? round2(PESOS.SURTIDOR_MAYOREO.partidas_hora * clamp01(row.partidas_netas_por_hora_calculo / maxPartidasHora)) : 0
+        monto: maxPartidasHora ? round2(PESOS.SURTIDOR_MAYOREO.partidas_hora * clamp01(row.partidas_netas_por_hora_calculo / maxPartidasHora) * efectividadRatio) : 0
       },
       tickets: {
-        label: 'Tickets',
+        label: 'Tickets con efectividad diaria > 90%',
         peso: PESOS.SURTIDOR_MAYOREO.tickets,
         valor: toNumber(row.tickets),
-        monto: row.cumple_efectividad_minima && maxTickets ? round2(PESOS.SURTIDOR_MAYOREO.tickets * clamp01(toNumber(row.tickets) / maxTickets)) : 0
+        monto: maxTickets ? round2(PESOS.SURTIDOR_MAYOREO.tickets * clamp01(toNumber(row.tickets) / maxTickets) * efectividadRatio) : 0
       },
       neto: {
-        label: 'Neto',
+        label: 'Neto con efectividad diaria > 90%',
         peso: PESOS.SURTIDOR_MAYOREO.neto,
         valor: round2(row.neto),
-        monto: row.cumple_efectividad_minima && maxNeto ? round2(PESOS.SURTIDOR_MAYOREO.neto * clamp01(toNumber(row.neto) / maxNeto)) : 0
+        monto: maxNeto ? round2(PESOS.SURTIDOR_MAYOREO.neto * clamp01(toNumber(row.neto) / maxNeto) * efectividadRatio) : 0
       },
       negados: {
         label: 'Negados penalizables',
@@ -784,8 +989,11 @@ async function calcularSurtidoresMayoreo(desde, hasta, incidenciasMap) {
         tickets: toNumber(row.tickets),
         partidas_oficiales: toNumber(row.partidas_oficiales),
         efectividad_pct: row.efectividad_pct,
-        cumple_efectividad_minima: row.cumple_efectividad_minima,
-        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}%`,
+        efectividad_minima_requerida: `>${EFECTIVIDAD_MINIMA_PCT}% por día`,
+        dias_efectividad: row.dias,
+        dias_evaluados: row.dias_evaluados,
+        dias_cumplen_efectividad: row.dias_cumplen_efectividad,
+        cumplimiento_efectividad_dias_pct: row.cumplimiento_efectividad_dias_pct,
         negados_penalizables: row.negados_penalizables,
         negados_no_penalizan: row.negados_no_penalizan,
         negados_pendientes: row.negados_pendientes,
@@ -1050,16 +1258,7 @@ async function guardarCalculo(connection, req, { desde, hasta, motivo, resumen, 
   return periodoId;
 }
 
-export const calcularComisiones = asyncHandler(async (req, res) => {
-  const payload = {
-    ...req.query,
-    ...req.body
-  };
-
-  const { desde, hasta } = getDateFilters(payload);
-  const dryRun = payload.dry_run === false || payload.dry_run === 'false' ? false : true;
-  const motivo = String(payload.motivo || '').trim();
-
+async function calcularComisionesData(desde, hasta) {
   const incidencias = await getIncidenciasActivas(desde, hasta);
   const incidenciasMap = mapIncidencias(incidencias);
 
@@ -1073,11 +1272,37 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
     ...surtidoresMayoreo
   ];
 
-  const base = fusionarComisionesOperativas(componentesOperativos);
+  /*
+    La comisión de encargado se evalúa contra el equipo ya fusionado para contar
+    personas y no roles duplicados. Después se vuelve a fusionar con los rubros
+    propios del usuario encargado para respetar el tope único de $2,000.
+  */
+  const baseEquipo = fusionarComisionesOperativas(componentesOperativos);
+  const encargados = await calcularEncargados(incidenciasMap, baseEquipo);
+  const comisiones = fusionarComisionesOperativas([
+    ...componentesOperativos,
+    ...encargados
+  ]);
 
-  const encargados = await calcularEncargados(incidenciasMap, base);
-  const comisiones = [...base, ...encargados];
   const resumen = normalizeResumen(buildResumen(comisiones));
+
+  return {
+    resumen,
+    comisiones
+  };
+}
+
+export const calcularComisiones = asyncHandler(async (req, res) => {
+  const payload = {
+    ...req.query,
+    ...req.body
+  };
+
+  const { desde, hasta } = getDateFilters(payload);
+  const dryRun = payload.dry_run === false || payload.dry_run === 'false' ? false : true;
+  const motivo = String(payload.motivo || '').trim();
+
+  const { resumen, comisiones } = await calcularComisionesData(desde, hasta);
 
   let periodoId = null;
 
@@ -1112,16 +1337,144 @@ export const calcularComisiones = asyncHandler(async (req, res) => {
     reglas: {
       base_comision: BASE_COMISION,
       pesos: PESOS,
-      checadores_meta: 'total_partidas_surtidores_sucursales / total_horas_jornada_checadores_activos',
+      checadores_meta: 'por día: total_partidas_surtidores_sucursales_día / checadores_activos_día; la meta individual es la suma diaria',
       mayoreo_partidas_netas: 'partidas_oficiales - negados_penalizables',
-      usuario_mixto: 'surtidor + checador se fusiona en una sola comisión con tope de $2,000; cada función aporta 50% en escala',
-      efectividad_minima: `surtidores sucursal y mayoreo requieren más de ${EFECTIVIDAD_MINIMA_PCT}% para ganar la parte de productividad/efectividad`,
+      usuario_mixto: 'todas las funciones del mismo usuario se fusionan en una sola comisión con tope de $2,000; si tiene encargado se fusiona con su rol operativo',
+      efectividad_minima: `surtidores sucursal y mayoreo requieren más de ${EFECTIVIDAD_MINIMA_PCT}% de efectividad individual por día para ganar la parte de productividad/efectividad`,
       bloqueos_automaticos: 'inasistencia injustificada, mal empaque o negados penalizables excedidos dejan el bono en $0',
       encargado: 'comisiona si más del 50% del equipo combinado comisiona'
     },
     resumen,
     comisiones
   });
+});
+
+
+function getDesgloseMonto(desglose, key) {
+  return toNumber(desglose?.[key]?.monto);
+}
+
+function getBloqueosTexto(bloqueos = []) {
+  if (!Array.isArray(bloqueos) || !bloqueos.length) return '';
+  return bloqueos.map((bloqueo) => bloqueo.message || bloqueo.codigo).filter(Boolean).join(' | ');
+}
+
+function buildComisionesExportRows(comisiones = []) {
+  return comisiones.map((item) => ({
+    Usuario: item.usuario_nombre || '',
+    Código: item.usuario || '',
+    Tipo: item.tipo_comision || '',
+    Estado: item.bloqueado ? 'BLOQUEADO' : item.comisiona ? 'COMISIONA' : 'NO_COMISIONA',
+    'Monto final': toNumber(item.monto_final),
+    'Proceso bono': toNumber(item.monto_acumulado),
+    'Efectividad / Cumplimiento días %': toNumber(item.metricas?.cumplimiento_efectividad_dias_pct ?? item.metricas?.cumplimiento_meta_pct ?? 0),
+    'Partidas surtidas': toNumber(item.metricas?.partidas_surtidas ?? item.metricas?.partidas_oficiales ?? 0),
+    'Partidas netas': toNumber(item.metricas?.partidas_netas ?? 0),
+    'TP checador': toNumber(item.metricas?.tp ?? 0),
+    'Meta checador': toNumber(item.metricas?.meta_individual ?? 0),
+    'Tickets': toNumber(item.metricas?.tickets ?? 0),
+    'Neto': toNumber(item.metricas?.neto ?? 0),
+    'Negados penalizables': toNumber(item.metricas?.negados_penalizables ?? 0),
+    'Negados pendientes': toNumber(item.metricas?.negados_pendientes ?? 0),
+    'Bloqueos': getBloqueosTexto(item.bloqueos),
+    'Efectividad': getDesgloseMonto(item.desglose, 'efectividad'),
+    'No surtido': getDesgloseMonto(item.desglose, 'no_surtido'),
+    'Asistencia': getDesgloseMonto(item.desglose, 'asistencia'),
+    'Orden': getDesgloseMonto(item.desglose, 'orden'),
+    'Puntualidad': getDesgloseMonto(item.desglose, 'puntualidad'),
+    'Productividad / TP': getDesgloseMonto(item.desglose, 'productividad'),
+    'Mal empaque': getDesgloseMonto(item.desglose, 'mal_empaque'),
+    'Faltante sobrante': getDesgloseMonto(item.desglose, 'faltante_sobrante'),
+    'Partidas netas rubro': getDesgloseMonto(item.desglose, 'partidas_netas'),
+    'Partidas hora': getDesgloseMonto(item.desglose, 'partidas_hora'),
+    'Tickets rubro': getDesgloseMonto(item.desglose, 'tickets'),
+    'Neto rubro': getDesgloseMonto(item.desglose, 'neto'),
+    'Negados rubro': getDesgloseMonto(item.desglose, 'negados'),
+    'Mayoría equipo': getDesgloseMonto(item.desglose, 'mayoria_equipo')
+  }));
+}
+
+function buildDesgloseExportRows(comisiones = []) {
+  const rows = [];
+
+  for (const item of comisiones) {
+    for (const [clave, rubro] of Object.entries(item.desglose || {})) {
+      rows.push({
+        Usuario: item.usuario_nombre || '',
+        Código: item.usuario || '',
+        Tipo: item.tipo_comision || '',
+        Rubro: rubro.label || clave,
+        Peso: toNumber(rubro.peso),
+        Valor: toNumber(rubro.valor),
+        Monto: toNumber(rubro.monto),
+        Bloqueado: rubro.bloqueado ? 'SI' : 'NO'
+      });
+    }
+  }
+
+  return rows;
+}
+
+function buildDiasExportRows(comisiones = []) {
+  const rows = [];
+
+  for (const item of comisiones) {
+    const dias = item.metricas?.dias_efectividad || item.metricas?.dias || [];
+
+    for (const dia of dias) {
+      rows.push({
+        Usuario: item.usuario_nombre || '',
+        Código: item.usuario || '',
+        Tipo: item.tipo_comision || '',
+        Fecha: dia.fecha || '',
+        'Partidas / TP': toNumber(dia.partidas_surtidas ?? dia.partidas_oficiales ?? dia.tp ?? 0),
+        'Partidas netas': toNumber(dia.partidas_netas ?? 0),
+        'Negados penalizables': toNumber(dia.negados_penalizables ?? 0),
+        'Meta día': toNumber(dia.meta_dia ?? 0),
+        'Cumple efectividad': dia.cumple_efectividad === undefined ? '' : dia.cumple_efectividad ? 'SI' : 'NO',
+        'Cumplimiento día %': toNumber(dia.cumplimiento_dia_pct ?? dia.efectividad_pct ?? 0)
+      });
+    }
+  }
+
+  return rows;
+}
+
+function appendSheet(workbook, name, rows) {
+  const safeRows = rows.length ? rows : [{ Información: 'Sin datos' }];
+  const sheet = XLSX.utils.json_to_sheet(safeRows);
+  XLSX.utils.book_append_sheet(workbook, sheet, name.slice(0, 31));
+}
+
+export const exportarComisionesExcel = asyncHandler(async (req, res) => {
+  const { desde, hasta } = getDateFilters(req.query);
+  const { resumen, comisiones } = await calcularComisionesData(desde, hasta);
+
+  const workbook = XLSX.utils.book_new();
+
+  appendSheet(workbook, 'Resumen', [{
+    Desde: desde,
+    Hasta: hasta,
+    Registros: resumen.total_registros,
+    Comisionan: resumen.comisionan,
+    Bloqueados: resumen.bloqueados,
+    'Monto final': resumen.total_monto_final
+  }]);
+
+  appendSheet(workbook, 'Comisiones', buildComisionesExportRows(comisiones));
+  appendSheet(workbook, 'Desglose', buildDesgloseExportRows(comisiones));
+  appendSheet(workbook, 'Diario', buildDiasExportRows(comisiones));
+
+  const buffer = XLSX.write(workbook, {
+    type: 'buffer',
+    bookType: 'xlsx'
+  });
+
+  const filename = `comisiones_${desde}_${hasta}.xlsx`;
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(buffer);
 });
 
 export const listarPeriodos = asyncHandler(async (req, res) => {

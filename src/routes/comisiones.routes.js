@@ -3,6 +3,7 @@ import { Router } from 'express';
 import {
   calcularComisiones,
   crearIncidencia,
+  exportarComisionesExcel,
   detallePeriodo,
   listarIncidencias,
   listarPeriodos,
@@ -17,6 +18,7 @@ router.use(authMiddleware);
 router.use(requireRoles('ADMIN', 'SUPERVISOR'));
 
 router.post('/calcular', calcularComisiones);
+router.get('/exportar', exportarComisionesExcel);
 router.get('/periodos', listarPeriodos);
 router.get('/periodos/:id', detallePeriodo);
 
