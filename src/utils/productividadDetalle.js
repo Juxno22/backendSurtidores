@@ -1,4 +1,5 @@
 import {
+  getFechaOperativaPorTipo,
   getJornadaLaboral,
   getJornadaTranscurridaSegundos,
   getSegundosLaboralesEntre
@@ -44,27 +45,33 @@ export function eachDate(desde, hasta) {
   return dates;
 }
 
-export function getJornadaDisponibleSegundosPorFecha(fecha) {
-  const hoy = getFechaOperativaMexico();
+export function getJornadaDisponibleSegundosPorFecha(fecha, tipoOperacion = 'SUCURSAL') {
+  const hoyOperativo =
+    getFechaOperativaPorTipo(tipoOperacion, getNowMexicoDateTime()) ||
+    getFechaOperativaMexico();
 
-  if (fecha > hoy) return 0;
+  if (fecha > hoyOperativo) return 0;
 
-  if (fecha === hoy) {
-    return getJornadaTranscurridaSegundos(fecha, getNowMexicoDateTime());
+  if (fecha === hoyOperativo) {
+    return getJornadaTranscurridaSegundos(
+      fecha,
+      getNowMexicoDateTime(),
+      tipoOperacion
+    );
   }
 
-  const jornada = getJornadaLaboral(fecha);
+  const jornada = getJornadaLaboral(fecha, tipoOperacion);
 
   if (!jornada.es_laboral) return 0;
 
   return jornada.minutos_netos * 60;
 }
 
-export function getJornadaDisponibleSegundosPorFechas(fechas = []) {
+export function getJornadaDisponibleSegundosPorFechas(fechas = [], tipoOperacion = 'SUCURSAL') {
   const uniqueDates = [...new Set(fechas.filter(Boolean))];
 
   return uniqueDates.reduce((total, fecha) => {
-    return total + getJornadaDisponibleSegundosPorFecha(fecha);
+    return total + getJornadaDisponibleSegundosPorFecha(fecha, tipoOperacion);
   }, 0);
 }
 
@@ -87,7 +94,9 @@ export function calcularMetricasSesion(row, tiempoMuertoAnteriorSegundos = 0) {
   if (!duracionLaboralSegundos && row.hora_inicio && row.hora_fin) {
     duracionLaboralSegundos = getSegundosLaboralesEntre(
       row.hora_inicio,
-      row.hora_fin
+      row.hora_fin,
+      row.tipo_operacion || 'SUCURSAL',
+      row.fecha_operativa
     );
   }
 
@@ -141,7 +150,9 @@ export function construirDetalleSurtidores(rows = []) {
     ) {
       const gap = getSegundosLaboralesEntre(
         previous.hora_fin,
-        row.hora_inicio
+        row.hora_inicio,
+        row.tipo_operacion || previous.tipo_operacion || 'SUCURSAL',
+        row.fecha_operativa
       );
 
       tiempoMuertoAnteriorSegundos = Math.max(0, gap);
@@ -164,6 +175,7 @@ export function construirDetalleSurtidores(rows = []) {
         surtidor_nombre: row.surtidor_nombre,
         surtidor_codigo: row.surtidor_codigo,
         surtidor_usuario: row.surtidor_usuario,
+        tipo_operacion: row.tipo_operacion || 'SUCURSAL',
 
         fechas_set: new Set(),
         sucursales_set: new Set(),
@@ -201,7 +213,10 @@ export function construirDetalleSurtidores(rows = []) {
   const ranking = [...summaryBySurtidor.values()]
     .map((item) => {
       const fechas = [...item.fechas_set];
-      const jornadaDisponibleSegundos = getJornadaDisponibleSegundosPorFechas(fechas);
+      const jornadaDisponibleSegundos = getJornadaDisponibleSegundosPorFechas(
+        fechas,
+        item.tipo_operacion || 'SUCURSAL'
+      );
 
       const tiempoOperativoSegundos =
         item.tiempo_activo_segundos + item.tiempo_muerto_segundos;
@@ -211,6 +226,7 @@ export function construirDetalleSurtidores(rows = []) {
         surtidor_nombre: item.surtidor_nombre,
         surtidor_codigo: item.surtidor_codigo,
         surtidor_usuario: item.surtidor_usuario,
+        tipo_operacion: item.tipo_operacion || 'SUCURSAL',
 
         fechas,
         sucursales: [...item.sucursales_set],

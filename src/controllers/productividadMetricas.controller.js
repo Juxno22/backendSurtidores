@@ -125,7 +125,12 @@ function buildSessionMetrics(row, nowMexico) {
 
   const duracionLaboralSegundos = estado === 'FINALIZADO'
     ? toNumber(row.duracion_laboral_segundos)
-    : getSegundosLaboralesEntre(horaInicio, horaFin);
+    : getSegundosLaboralesEntre(
+        horaInicio,
+        horaFin,
+        row.tipo_operacion || 'SUCURSAL',
+        row.fecha_operativa
+      );
 
   return {
     ...row,
@@ -187,7 +192,9 @@ function calcularTiemposMuertosPorSurtidor(sesiones) {
 
       const gapSeconds = getSegundosLaboralesEntre(
         previous.hora_fin,
-        current.hora_inicio
+        current.hora_inicio,
+        current.tipo_operacion || previous.tipo_operacion || 'SUCURSAL',
+        current.fecha_operativa
       );
 
       muertosBySesionId.set(current.id, Math.max(0, gapSeconds));
@@ -209,7 +216,11 @@ function buildResumenFromTotals({
 
   const surtidoresActivos = new Set(sesiones.map((s) => Number(s.surtidor_id))).size;
 
-  const jornadaTranscurridaSegundos = getJornadaTranscurridaSegundos(fecha, nowMexico);
+  const jornadaTranscurridaSegundos = getJornadaTranscurridaSegundos(
+    fecha,
+    nowMexico,
+    jornada.tipo_operacion || 'SUCURSAL'
+  );
   const jornadaTotalSegundos = toNumber(jornada.minutos_netos) * 60;
   const jornadaDisponibleEquipoSegundos = jornadaTranscurridaSegundos * surtidoresActivos;
 
@@ -375,6 +386,7 @@ function buildSurtidores({ sesiones, resumen }) {
         surtidor_nombre: sesion.surtidor_nombre,
         surtidor_usuario: sesion.surtidor_usuario,
         surtidor_codigo: sesion.surtidor_codigo,
+        tipo_operacion: sesion.tipo_operacion || 'SUCURSAL',
 
         sesiones: 0,
         sesiones_finalizadas: 0,
@@ -554,13 +566,27 @@ function buildHorasPico({ sesiones }) {
 export const productividadJornada = asyncHandler(async (req, res) => {
   const fecha = validarFecha(req.query.fecha);
   const sucursalId = toPositiveIdOptional(req.query.sucursal_id, 'sucursal_id');
+  const tipoOperacion = String(req.query.tipo_operacion || 'SUCURSAL').trim().toUpperCase();
+
+  if (!['SUCURSAL', 'MAYOREO'].includes(tipoOperacion)) {
+    const error = new Error('tipo_operacion debe ser SUCURSAL o MAYOREO');
+    error.status = 400;
+    throw error;
+  }
+
+  if (tipoOperacion === 'MAYOREO' && sucursalId) {
+    const error = new Error('Mayoreo no usa filtro de sucursal');
+    error.status = 400;
+    throw error;
+  }
 
   const nowMexico = getNowMexicoDateTime();
-  const jornada = getJornadaLaboral(fecha);
+  const jornada = getJornadaLaboral(fecha, tipoOperacion);
 
-  const params = [fecha];
+  const params = [fecha, tipoOperacion];
   const where = [
     'ps.fecha_operativa = ?',
+    'ps.tipo_operacion = ?',
     "ps.estado IN ('FINALIZADO', 'EN_PROCESO')"
   ];
 
@@ -576,6 +602,7 @@ export const productividadJornada = asyncHandler(async (req, res) => {
       DATE_FORMAT(ps.fecha_operativa, '%Y-%m-%d') AS fecha_operativa,
 
       ps.surtidor_id,
+      ps.tipo_operacion,
       u.nombre AS surtidor_nombre,
       u.usuario AS surtidor_usuario,
       su.codigo AS surtidor_codigo,
@@ -599,33 +626,42 @@ export const productividadJornada = asyncHandler(async (req, res) => {
     FROM productividad_sesiones ps
     INNER JOIN surtidores su ON su.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = ps.usuario_id
-    INNER JOIN sucursales s ON s.id = ps.sucursal_id
+    LEFT JOIN sucursales s ON s.id = ps.sucursal_id
     WHERE ${where.join(' AND ')}
     ORDER BY ps.surtidor_id ASC, ps.hora_inicio ASC
     `,
     params
   );
 
-  const paramsReporte = [fecha];
-  const whereReporte = ['rg.fecha = ?'];
+  let reporteRows = [{
+    surtido_total: 0,
+    partidas_surtidas: 0,
+    ceros: 0,
+    negados: 0
+  }];
 
-  if (sucursalId) {
-    whereReporte.push('rg.sucursal_id = ?');
-    paramsReporte.push(sucursalId);
+  if (tipoOperacion === 'SUCURSAL') {
+    const paramsReporte = [fecha];
+    const whereReporte = ['rg.fecha = ?'];
+
+    if (sucursalId) {
+      whereReporte.push('rg.sucursal_id = ?');
+      paramsReporte.push(sucursalId);
+    }
+
+    [reporteRows] = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(rg.surtido), 0) AS surtido_total,
+        COALESCE(SUM(rg.partidas), 0) AS partidas_surtidas,
+        COALESCE(SUM(rg.ceros), 0) AS ceros,
+        COALESCE(SUM(rg.no_surtido), 0) AS negados
+      FROM reporte_grupal_surtido rg
+      WHERE ${whereReporte.join(' AND ')}
+      `,
+      paramsReporte
+    );
   }
-
-  const [reporteRows] = await pool.query(
-    `
-    SELECT
-      COALESCE(SUM(rg.surtido), 0) AS surtido_total,
-      COALESCE(SUM(rg.partidas), 0) AS partidas_surtidas,
-      COALESCE(SUM(rg.ceros), 0) AS ceros,
-      COALESCE(SUM(rg.no_surtido), 0) AS negados
-    FROM reporte_grupal_surtido rg
-    WHERE ${whereReporte.join(' AND ')}
-    `,
-    paramsReporte
-  );
 
   const sesiones = sesionesRows.map((row) => buildSessionMetrics(row, nowMexico));
 
@@ -657,7 +693,8 @@ export const productividadJornada = asyncHandler(async (req, res) => {
     ok: true,
     fecha,
     filtros: {
-      sucursal_id: sucursalId
+      sucursal_id: sucursalId,
+      tipo_operacion: tipoOperacion
     },
     resumen,
     surtidores,

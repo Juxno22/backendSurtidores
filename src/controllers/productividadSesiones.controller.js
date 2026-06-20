@@ -6,6 +6,7 @@ import {
   diffSecondsLocal
 } from '../utils/mexicoTime.js';
 import {
+  getFechaOperativaPorTipo,
   getSegundosLaboralesEntre
 } from '../utils/jornadaLaboral.js';
 
@@ -55,17 +56,26 @@ async function safeRollback(connection) {
 function formatRuntimeFields(row, nowMexico = getNowMexicoDateTime()) {
   if (!row) return row;
 
+  const tipoOperacion = row.tipo_operacion || row.surtidor_tipo_operacion || 'SUCURSAL';
   const isActive = row.estado === 'EN_PROCESO';
+
   const runtimeSeconds = isActive
     ? diffSecondsLocal(row.hora_inicio, nowMexico)
     : Number(row.duracion_segundos || 0);
 
   const runtimeLaboralSeconds = isActive
-    ? getSegundosLaboralesEntre(row.hora_inicio, nowMexico)
+    ? getSegundosLaboralesEntre(
+        row.hora_inicio,
+        nowMexico,
+        tipoOperacion,
+        row.fecha_operativa
+      )
     : Number(row.duracion_laboral_segundos || 0);
 
   return {
     ...row,
+
+    tipo_operacion: tipoOperacion,
 
     surtido_total: Number(row.tickets || 0),
     partidas_surtidas: Number(row.partidas || 0),
@@ -149,6 +159,8 @@ async function obtenerSurtidorOperacion(connection, req, surtidorIdBody = null) 
         su.id,
         su.usuario_id,
         su.codigo,
+        su.codigo_reporte,
+        su.tipo_operacion,
         su.activo,
         u.nombre,
         u.usuario
@@ -183,6 +195,8 @@ async function obtenerSurtidorOperacion(connection, req, surtidorIdBody = null) 
       su.id,
       su.usuario_id,
       su.codigo,
+      su.codigo_reporte,
+      su.tipo_operacion,
       su.activo,
       u.nombre,
       u.usuario
@@ -227,6 +241,9 @@ async function obtenerSesionPorId(connection, id) {
       u.nombre AS surtidor_nombre,
       u.usuario AS surtidor_usuario,
       su.codigo AS surtidor_codigo,
+      su.codigo_reporte AS surtidor_codigo_reporte,
+      su.tipo_operacion AS surtidor_tipo_operacion,
+      ps.tipo_operacion,
 
       ps.sucursal_id,
       s.nombre AS sucursal_nombre,
@@ -267,14 +284,49 @@ async function obtenerSesionPorId(connection, id) {
     FROM productividad_sesiones ps
     INNER JOIN surtidores su ON su.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = ps.usuario_id
-    INNER JOIN sucursales s ON s.id = ps.sucursal_id
+    LEFT JOIN sucursales s ON s.id = ps.sucursal_id
     WHERE ps.id = ?
     LIMIT 1
     `,
     [id]
   );
 
-  return formatRuntimeFields(rows[0] || null);
+  const sesion = formatRuntimeFields(rows[0] || null);
+
+  if (!sesion) return null;
+
+  const [negadosDetalle] = await connection.query(
+    `
+    SELECT
+      id,
+      codigo_producto,
+      razon_codigo,
+      razon_texto,
+      linea,
+      cantidad_negada,
+      comentario_surtidor,
+      estado_revision,
+      penaliza,
+      comentario_supervisor,
+      revisado_por,
+      DATE_FORMAT(revisado_at, '%Y-%m-%d %H:%i:%s') AS revisado_at,
+      DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at
+    FROM productividad_sesion_negados
+    WHERE sesion_id = ?
+    ORDER BY id ASC
+    `,
+    [id]
+  );
+
+  return {
+    ...sesion,
+    negados_detalle: negadosDetalle.map((item) => ({
+      ...item,
+      cantidad_negada: Number(item.cantidad_negada || 0),
+      penaliza: Boolean(item.penaliza)
+    }))
+  };
 }
 
 function construirPayloadDatos(body, actual = {}) {
@@ -313,9 +365,172 @@ function construirPayloadDatos(body, actual = {}) {
   };
 }
 
-export const iniciarSesion = asyncHandler(async (req, res) => {
-  const sucursalId = toPositiveId(req.body.sucursal_id, 'sucursal_id');
+function normalizeProductoCode(value) {
+  return String(value ?? '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+}
 
+function normalizeRazonCode(value) {
+  return String(value ?? '')
+    .trim()
+    .toUpperCase();
+}
+
+function parseNegadosDeclarados(body, datos) {
+  const raw = Array.isArray(body.negados_detalle)
+    ? body.negados_detalle
+    : Array.isArray(body.negados_declarados)
+      ? body.negados_declarados
+      : [];
+
+  const items = raw
+    .map((item, index) => {
+      const codigoProducto = normalizeProductoCode(item.codigo_producto);
+      const razonCodigo = normalizeRazonCode(item.razon_codigo || item.razon);
+      const linea = String(item.linea ?? '').trim();
+      const cantidadNegada = toNonNegativeInt(
+        item.cantidad_negada ?? item.cantidad,
+        `negados_detalle[${index}].cantidad_negada`,
+        0
+      );
+      const comentarioSurtidor = String(item.comentario_surtidor || item.comentario || '').trim();
+
+      if (!codigoProducto && !razonCodigo && !linea && cantidadNegada === 0 && !comentarioSurtidor) {
+        return null;
+      }
+
+      if (!codigoProducto) {
+        const error = new Error(`El código del producto es obligatorio en el negado ${index + 1}`);
+        error.status = 400;
+        throw error;
+      }
+
+      if (!razonCodigo) {
+        const error = new Error(`La razón del negado es obligatoria en el negado ${index + 1}`);
+        error.status = 400;
+        throw error;
+      }
+
+      if (!linea) {
+        const error = new Error(`La línea es obligatoria en el negado ${index + 1}`);
+        error.status = 400;
+        throw error;
+      }
+
+      if (cantidadNegada <= 0) {
+        const error = new Error(`La cantidad negada debe ser mayor a 0 en el negado ${index + 1}`);
+        error.status = 400;
+        throw error;
+      }
+
+      return {
+        codigo_producto: codigoProducto,
+        razon_codigo: razonCodigo,
+        linea,
+        cantidad_negada: cantidadNegada,
+        comentario_surtidor: comentarioSurtidor || null
+      };
+    })
+    .filter(Boolean);
+
+  const totalDeclarado = items.reduce((acc, item) => acc + item.cantidad_negada, 0);
+
+  if (Number(datos.negados || 0) > 0 && totalDeclarado !== Number(datos.negados || 0)) {
+    const error = new Error(`La suma de negados declarados (${totalDeclarado}) debe coincidir con el total de negados (${datos.negados})`);
+    error.status = 400;
+    throw error;
+  }
+
+  if (Number(datos.negados || 0) === 0 && totalDeclarado > 0) {
+    const error = new Error('No puedes declarar detalle de negados si el total de negados es 0');
+    error.status = 400;
+    throw error;
+  }
+
+  return items;
+}
+
+async function guardarNegadosDeclarados(connection, sesion, negadosDetalle) {
+  await connection.query(
+    'DELETE FROM productividad_sesion_negados WHERE sesion_id = ?',
+    [sesion.id]
+  );
+
+  if (!negadosDetalle.length) return [];
+
+  const razonCodigos = [...new Set(negadosDetalle.map((item) => item.razon_codigo))];
+
+  const [motivos] = await connection.query(
+    `
+    SELECT codigo, nombre
+    FROM productividad_negados_motivos
+    WHERE codigo IN (?)
+      AND activo = 1
+    `,
+    [razonCodigos]
+  );
+
+  const motivosMap = new Map(motivos.map((motivo) => [motivo.codigo, motivo.nombre]));
+  const faltantes = razonCodigos.filter((codigo) => !motivosMap.has(codigo));
+
+  if (faltantes.length) {
+    const error = new Error(`Razón de negado inválida: ${faltantes.join(', ')}`);
+    error.status = 400;
+    throw error;
+  }
+
+  const insertados = [];
+
+  for (const item of negadosDetalle) {
+    const [result] = await connection.query(
+      `
+      INSERT INTO productividad_sesion_negados (
+        sesion_id,
+        surtidor_id,
+        usuario_id,
+        fecha_operativa,
+        tipo_operacion,
+        codigo_producto,
+        razon_codigo,
+        razon_texto,
+        linea,
+        cantidad_negada,
+        comentario_surtidor,
+        estado_revision,
+        penaliza
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE_REVISION', 0)
+      `,
+      [
+        sesion.id,
+        sesion.surtidor_id,
+        sesion.usuario_id,
+        sesion.fecha_operativa,
+        sesion.tipo_operacion || 'SUCURSAL',
+        item.codigo_producto,
+        item.razon_codigo,
+        motivosMap.get(item.razon_codigo),
+        item.linea,
+        item.cantidad_negada,
+        item.comentario_surtidor
+      ]
+    );
+
+    insertados.push({
+      id: result.insertId,
+      ...item,
+      razon_texto: motivosMap.get(item.razon_codigo),
+      estado_revision: 'PENDIENTE_REVISION',
+      penaliza: false
+    });
+  }
+
+  return insertados;
+}
+
+export const iniciarSesion = asyncHandler(async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
@@ -327,7 +542,19 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       req.body.surtidor_id
     );
 
-    await validarSucursalActiva(connection, sucursalId);
+    const tipoOperacion = String(surtidor.tipo_operacion || 'SUCURSAL').trim().toUpperCase();
+    let sucursalId = null;
+
+    if (tipoOperacion === 'SUCURSAL') {
+      sucursalId = toPositiveId(req.body.sucursal_id, 'sucursal_id');
+      await validarSucursalActiva(connection, sucursalId);
+    }
+
+    if (tipoOperacion === 'MAYOREO' && req.body.sucursal_id) {
+      const error = new Error('Mayoreo no debe iniciar sesión con sucursal destino');
+      error.status = 400;
+      throw error;
+    }
 
     const [abierta] = await connection.query(
       `
@@ -350,8 +577,8 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
       });
     }
 
-    const fechaOperativa = getFechaOperativaMexico();
     const horaInicio = getNowMexicoDateTime();
+    const fechaOperativa = getFechaOperativaPorTipo(tipoOperacion, horaInicio);
 
     const [result] = await connection.query(
       `
@@ -359,17 +586,23 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
         surtidor_id,
         usuario_id,
         sucursal_id,
+        tipo_operacion,
         fecha_operativa,
         hora_inicio,
-        estado
+        estado,
+        created_at,
+        updated_at
       )
-      VALUES (?, ?, ?, ?, ?, 'EN_PROCESO')
+      VALUES (?, ?, ?, ?, ?, ?, 'EN_PROCESO', ?, ?)
       `,
       [
         surtidor.id,
         req.user.id,
         sucursalId,
+        tipoOperacion,
         fechaOperativa,
+        horaInicio,
+        horaInicio,
         horaInicio
       ]
     );
@@ -385,6 +618,7 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
         surtidor_id: surtidor.id,
         usuario_id: req.user.id,
         sucursal_id: sucursalId,
+        tipo_operacion: tipoOperacion,
         fecha_operativa: fechaOperativa,
         hora_inicio: horaInicio,
         estado: 'EN_PROCESO'
@@ -407,6 +641,7 @@ export const iniciarSesion = asyncHandler(async (req, res) => {
     connection.release();
   }
 });
+
 
 export const obtenerSesionActiva = asyncHandler(async (req, res) => {
   const connection = await pool.getConnection();
@@ -442,6 +677,9 @@ export const obtenerSesionActiva = asyncHandler(async (req, res) => {
         u.nombre AS surtidor_nombre,
         u.usuario AS surtidor_usuario,
         su.codigo AS surtidor_codigo,
+        su.codigo_reporte AS surtidor_codigo_reporte,
+        su.tipo_operacion AS surtidor_tipo_operacion,
+        ps.tipo_operacion,
 
         ps.sucursal_id,
         s.nombre AS sucursal_nombre,
@@ -469,7 +707,7 @@ export const obtenerSesionActiva = asyncHandler(async (req, res) => {
       FROM productividad_sesiones ps
       INNER JOIN surtidores su ON su.id = ps.surtidor_id
       INNER JOIN usuarios u ON u.id = ps.usuario_id
-      INNER JOIN sucursales s ON s.id = ps.sucursal_id
+      LEFT JOIN sucursales s ON s.id = ps.sucursal_id
       WHERE ${where.join(' AND ')}
       ORDER BY ps.hora_inicio DESC
       LIMIT 20
@@ -483,6 +721,15 @@ export const obtenerSesionActiva = asyncHandler(async (req, res) => {
     if (req.user.rol === 'SURTIDOR' || req.query.surtidor_id) {
       return res.json({
         ok: true,
+        surtidor: surtidor ? {
+          id: surtidor.id,
+          usuario_id: surtidor.usuario_id,
+          codigo: surtidor.codigo,
+          codigo_reporte: surtidor.codigo_reporte,
+          tipo_operacion: surtidor.tipo_operacion || 'SUCURSAL',
+          nombre: surtidor.nombre,
+          usuario: surtidor.usuario
+        } : null,
         sesion: sesiones[0] || null
       });
     }
@@ -545,6 +792,9 @@ export const listarSesiones = asyncHandler(async (req, res) => {
       u.nombre AS surtidor_nombre,
       u.usuario AS surtidor_usuario,
       su.codigo AS surtidor_codigo,
+      su.codigo_reporte AS surtidor_codigo_reporte,
+      su.tipo_operacion AS surtidor_tipo_operacion,
+      ps.tipo_operacion,
 
       ps.sucursal_id,
       s.nombre AS sucursal_nombre,
@@ -592,7 +842,7 @@ export const listarSesiones = asyncHandler(async (req, res) => {
     FROM productividad_sesiones ps
     INNER JOIN surtidores su ON su.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = ps.usuario_id
-    INNER JOIN sucursales s ON s.id = ps.sucursal_id
+    LEFT JOIN sucursales s ON s.id = ps.sucursal_id
     ${whereSql}
     ORDER BY ps.fecha_operativa DESC, ps.hora_inicio DESC
     LIMIT ${safeLimit}
@@ -751,6 +1001,7 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
     }
 
     const datos = construirPayloadDatos(req.body, sesionActual);
+    const negadosDetalle = parseNegadosDeclarados(req.body, datos);
     const horaFin = getNowMexicoDateTime();
 
     const duracionSegundos = diffSecondsLocal(
@@ -760,7 +1011,9 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
 
     const duracionLaboralSegundos = getSegundosLaboralesEntre(
       sesionActual.hora_inicio,
-      horaFin
+      horaFin,
+      sesionActual.tipo_operacion || 'SUCURSAL',
+      sesionActual.fecha_operativa
     );
 
     const datosAntes = {
@@ -808,6 +1061,12 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
       ]
     );
 
+    const negadosInsertados = await guardarNegadosDeclarados(
+      connection,
+      sesionActual,
+      negadosDetalle
+    );
+
     await registrarEvento(connection, {
       sesionId: id,
       usuarioId: req.user.id,
@@ -818,6 +1077,7 @@ export const finalizarSesion = asyncHandler(async (req, res) => {
         hora_fin: horaFin,
         duracion_segundos: duracionSegundos,
         duracion_laboral_segundos: duracionLaboralSegundos,
+        negados_detalle: negadosInsertados,
         estado: 'FINALIZADO'
       }
     });
@@ -886,7 +1146,9 @@ export const cancelarSesion = asyncHandler(async (req, res) => {
 
     const duracionLaboralSegundos = getSegundosLaboralesEntre(
       sesionActual.hora_inicio,
-      horaFin
+      horaFin,
+      sesionActual.tipo_operacion || 'SUCURSAL',
+      sesionActual.fecha_operativa
     );
 
     await connection.query(

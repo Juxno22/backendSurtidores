@@ -5,3 +5,4 @@ src/sql/seed/sql
 
 .env
 .env.example
+sql

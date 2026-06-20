@@ -40,6 +40,11 @@ function buildSessionWhere(query) {
     params.push(query.surtidor_id);
   }
 
+  if (query.tipo_operacion) {
+    where.push('ps.tipo_operacion = ?');
+    params.push(String(query.tipo_operacion).trim().toUpperCase());
+  }
+
   return {
     whereSql: where.join(' AND '),
     params,
@@ -47,7 +52,8 @@ function buildSessionWhere(query) {
       desde,
       hasta,
       sucursal_id: query.sucursal_id || '',
-      surtidor_id: query.surtidor_id || ''
+      surtidor_id: query.surtidor_id || '',
+      tipo_operacion: query.tipo_operacion || ''
     }
   };
 }
@@ -65,6 +71,9 @@ async function getSesionesSurtidores(query) {
       u.nombre AS surtidor_nombre,
       u.usuario AS surtidor_usuario,
       st.codigo AS surtidor_codigo,
+      st.codigo_reporte AS surtidor_codigo_reporte,
+      st.tipo_operacion AS surtidor_tipo_operacion,
+      ps.tipo_operacion,
 
       ps.sucursal_id,
       sc.nombre AS sucursal_nombre,
@@ -88,7 +97,7 @@ async function getSesionesSurtidores(query) {
     FROM productividad_sesiones ps
     INNER JOIN surtidores st ON st.id = ps.surtidor_id
     INNER JOIN usuarios u ON u.id = st.usuario_id
-    INNER JOIN sucursales sc ON sc.id = ps.sucursal_id
+    LEFT JOIN sucursales sc ON sc.id = ps.sucursal_id
     WHERE ${whereSql}
     ORDER BY ps.fecha_operativa ASC, ps.surtidor_id ASC, ps.hora_inicio ASC
     `,

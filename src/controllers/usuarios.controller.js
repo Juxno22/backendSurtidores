@@ -37,6 +37,49 @@ function normalizarActivo(value, defaultValue = 1) {
   return Number(value) === 1 ? 1 : 0;
 }
 
+function normalizarBool(value, defaultValue = 0) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  return Number(value) === 1 || value === true || value === 'true' ? 1 : 0;
+}
+
+function construirFlagsEncargado(body = {}, actual = {}) {
+  const encargadoSurtidoresSucursal = normalizarBool(
+    body.encargado_surtidores_sucursal,
+    Number(actual.encargado_surtidores_sucursal || 0)
+  );
+
+  const encargadoChecadoresSucursal = normalizarBool(
+    body.encargado_checadores_sucursal,
+    Number(actual.encargado_checadores_sucursal || 0)
+  );
+
+  const encargadoSurtidoresMayoreo = normalizarBool(
+    body.encargado_surtidores_mayoreo,
+    Number(actual.encargado_surtidores_mayoreo || 0)
+  );
+
+  const esEncargado = normalizarBool(
+    body.es_encargado,
+    Number(actual.es_encargado || 0)
+  );
+
+  if (!esEncargado) {
+    return {
+      es_encargado: 0,
+      encargado_surtidores_sucursal: 0,
+      encargado_checadores_sucursal: 0,
+      encargado_surtidores_mayoreo: 0
+    };
+  }
+
+  return {
+    es_encargado: 1,
+    encargado_surtidores_sucursal: encargadoSurtidoresSucursal,
+    encargado_checadores_sucursal: encargadoChecadoresSucursal,
+    encargado_surtidores_mayoreo: encargadoSurtidoresMayoreo
+  };
+}
+
 async function validarSucursalOpcional(connection, sucursalId) {
   if (sucursalId === undefined || sucursalId === null || sucursalId === '') {
     return null;
@@ -93,11 +136,17 @@ async function obtenerUsuarioPorId(connection, id) {
       u.sucursal_id,
       s.nombre AS sucursal_nombre,
       u.activo,
+      u.es_encargado,
+      u.encargado_surtidores_sucursal,
+      u.encargado_checadores_sucursal,
+      u.encargado_surtidores_mayoreo,
       u.ultimo_login,
       DATE_FORMAT(u.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
       DATE_FORMAT(u.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at,
       su.id AS surtidor_id,
       su.codigo AS surtidor_codigo,
+      su.codigo_reporte AS surtidor_codigo_reporte,
+      su.tipo_operacion AS surtidor_tipo_operacion,
       c.id AS checador_id,
       c.codigo_reporte AS checador_codigo
     FROM usuarios u
@@ -114,7 +163,7 @@ async function obtenerUsuarioPorId(connection, id) {
 }
 
 export const listarUsuarios = asyncHandler(async (req, res) => {
-  const { rol, activo, search, disponibles_surtidor } = req.query;
+  const { rol, activo, search, disponibles_surtidor, es_encargado } = req.query;
 
   const where = [];
   const params = [];
@@ -137,6 +186,7 @@ export const listarUsuarios = asyncHandler(async (req, res) => {
   if (disponibles_surtidor !== undefined && disponibles_surtidor !== '') {
     where.push('su.id IS NULL');
     where.push('u.activo = 1');
+    where.push("u.rol = 'SURTIDOR'");
   }
 
   if (activo !== undefined && activo !== '') {
@@ -144,14 +194,25 @@ export const listarUsuarios = asyncHandler(async (req, res) => {
     params.push(Number(activo) === 1 ? 1 : 0);
   }
 
+  if (es_encargado !== undefined && es_encargado !== '') {
+    where.push('u.es_encargado = ?');
+    params.push(Number(es_encargado) === 1 ? 1 : 0);
+  }
+
   if (search && search.trim()) {
-    where.push('(u.nombre LIKE ? OR u.usuario LIKE ? OR u.rol LIKE ? OR s.nombre LIKE ?)');
-    params.push(
-      `%${search.trim()}%`,
-      `%${search.trim()}%`,
-      `%${search.trim()}%`,
-      `%${search.trim()}%`
-    );
+    where.push(`(
+      u.nombre LIKE ?
+      OR u.usuario LIKE ?
+      OR u.rol LIKE ?
+      OR s.nombre LIKE ?
+      OR su.codigo LIKE ?
+      OR su.codigo_reporte LIKE ?
+      OR su.tipo_operacion LIKE ?
+      OR c.codigo_reporte LIKE ?
+    )`);
+
+    const like = `%${search.trim()}%`;
+    params.push(like, like, like, like, like, like, like, like);
   }
 
   const [usuarios] = await pool.query(
@@ -164,11 +225,17 @@ export const listarUsuarios = asyncHandler(async (req, res) => {
       u.sucursal_id,
       s.nombre AS sucursal_nombre,
       u.activo,
+      u.es_encargado,
+      u.encargado_surtidores_sucursal,
+      u.encargado_checadores_sucursal,
+      u.encargado_surtidores_mayoreo,
       u.ultimo_login,
       DATE_FORMAT(u.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
       DATE_FORMAT(u.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at,
       su.id AS surtidor_id,
       su.codigo AS surtidor_codigo,
+      su.codigo_reporte AS surtidor_codigo_reporte,
+      su.tipo_operacion AS surtidor_tipo_operacion,
       c.id AS checador_id,
       c.codigo_reporte AS checador_codigo
     FROM usuarios u
@@ -211,6 +278,7 @@ export const crearUsuario = asyncHandler(async (req, res) => {
   const password = String(req.body.password || '');
   const rol = normalizarRol(req.body.rol || 'OPERATIVO');
   const activo = normalizarActivo(req.body.activo, 1);
+  const flagsEncargado = construirFlagsEncargado(req.body);
 
   if (!nombre) {
     return res.status(400).json({ ok: false, message: 'El nombre es obligatorio' });
@@ -245,10 +313,32 @@ export const crearUsuario = asyncHandler(async (req, res) => {
 
     const [result] = await connection.query(
       `
-      INSERT INTO usuarios (nombre, usuario, password_hash, rol, sucursal_id, activo)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO usuarios (
+        nombre,
+        usuario,
+        password_hash,
+        rol,
+        sucursal_id,
+        activo,
+        es_encargado,
+        encargado_surtidores_sucursal,
+        encargado_checadores_sucursal,
+        encargado_surtidores_mayoreo
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
-      [nombre, usuario, passwordHash, rol, sucursalId, activo]
+      [
+        nombre,
+        usuario,
+        passwordHash,
+        rol,
+        sucursalId,
+        activo,
+        flagsEncargado.es_encargado,
+        flagsEncargado.encargado_surtidores_sucursal,
+        flagsEncargado.encargado_checadores_sucursal,
+        flagsEncargado.encargado_surtidores_mayoreo
+      ]
     );
 
     const nuevoId = result.insertId;
@@ -260,7 +350,15 @@ export const crearUsuario = asyncHandler(async (req, res) => {
       accion: 'CREAR_USUARIO',
       entidad: 'usuarios',
       entidadId: nuevoId,
-      datosDespues: { id: nuevoId, nombre, usuario, rol, sucursal_id: sucursalId, activo }
+      datosDespues: {
+        id: nuevoId,
+        nombre,
+        usuario,
+        rol,
+        sucursal_id: sucursalId,
+        activo,
+        ...flagsEncargado
+      }
     });
 
     await connection.commit();
@@ -282,7 +380,22 @@ export const actualizarUsuario = asyncHandler(async (req, res) => {
     await connection.beginTransaction();
 
     const [actualRows] = await connection.query(
-      `SELECT id, nombre, usuario, rol, sucursal_id, activo FROM usuarios WHERE id = ? LIMIT 1`,
+      `
+      SELECT
+        id,
+        nombre,
+        usuario,
+        rol,
+        sucursal_id,
+        activo,
+        es_encargado,
+        encargado_surtidores_sucursal,
+        encargado_checadores_sucursal,
+        encargado_surtidores_mayoreo
+      FROM usuarios
+      WHERE id = ?
+      LIMIT 1
+      `,
       [id]
     );
 
@@ -300,6 +413,7 @@ export const actualizarUsuario = asyncHandler(async (req, res) => {
     const sucursalId = req.body.sucursal_id !== undefined
       ? await validarSucursalOpcional(connection, req.body.sucursal_id)
       : actual.sucursal_id;
+    const flagsEncargado = construirFlagsEncargado(req.body, actual);
 
     if (!nombre) {
       await connection.rollback();
@@ -349,18 +463,49 @@ export const actualizarUsuario = asyncHandler(async (req, res) => {
       usuario: actual.usuario,
       rol: actual.rol,
       sucursal_id: actual.sucursal_id,
-      activo: actual.activo
+      activo: actual.activo,
+      es_encargado: actual.es_encargado,
+      encargado_surtidores_sucursal: actual.encargado_surtidores_sucursal,
+      encargado_checadores_sucursal: actual.encargado_checadores_sucursal,
+      encargado_surtidores_mayoreo: actual.encargado_surtidores_mayoreo
     };
 
-    const datosDespues = { nombre, usuario, rol, sucursal_id: sucursalId, activo };
+    const datosDespues = {
+      nombre,
+      usuario,
+      rol,
+      sucursal_id: sucursalId,
+      activo,
+      ...flagsEncargado
+    };
 
     await connection.query(
       `
       UPDATE usuarios
-      SET nombre = ?, usuario = ?, rol = ?, sucursal_id = ?, activo = ?
+      SET
+        nombre = ?,
+        usuario = ?,
+        rol = ?,
+        sucursal_id = ?,
+        activo = ?,
+        es_encargado = ?,
+        encargado_surtidores_sucursal = ?,
+        encargado_checadores_sucursal = ?,
+        encargado_surtidores_mayoreo = ?
       WHERE id = ?
       `,
-      [nombre, usuario, rol, sucursalId, activo, id]
+      [
+        nombre,
+        usuario,
+        rol,
+        sucursalId,
+        activo,
+        flagsEncargado.es_encargado,
+        flagsEncargado.encargado_surtidores_sucursal,
+        flagsEncargado.encargado_checadores_sucursal,
+        flagsEncargado.encargado_surtidores_mayoreo,
+        id
+      ]
     );
 
     await registrarAuditoria(connection, {

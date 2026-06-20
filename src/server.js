@@ -34,6 +34,9 @@ import checadoresRoutes from './routes/checadores.routes.js';
 import productividadDetalleRoutes from './routes/productividadDetalle.routes.js';
 import productividadMantenimientoRoutes from './routes/productividadMantenimiento.routes.js';
 import productividadIntegralRoutes from './routes/productividadIntegral.routes.js';
+import productividadNegadosRoutes from './routes/productividadNegados.routes.js';
+import mayoreoRoutes from './routes/mayoreo.routes.js';
+import comisionesRoutes from './routes/comisiones.routes.js';
 
 const app = express();
 
@@ -137,6 +140,9 @@ app.use('/api/auditoria', auditoriaRoutes);
 app.use('/api/productividad/detalle', productividadDetalleRoutes);
 app.use('/api/productividad/integral', productividadIntegralRoutes);
 app.use('/api/productividad/mantenimiento', productividadMantenimientoRoutes);
+app.use('/api/productividad/negados', productividadNegadosRoutes);
+app.use('/api/mayoreo', mayoreoRoutes);
+app.use('/api/comisiones', comisionesRoutes);
 
 app.use(notFoundMiddleware);
 app.use(errorMiddleware);
